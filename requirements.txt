@@ -1,5 +1,6 @@
-# Runtime dependencies (ActiveState: `state install pyodbc` + `state install pyyaml`, or `state import requirements.txt`)
+# Runtime dependencies (ActiveState: add these packages to the project, then `state pull`)
 pyodbc>=4.0.39
-PyYAML>=6.0
+PyYAML>=6.0          # ActiveState may provide it as pyyaml-ft; both work
+openpyxl>=3.1        # Excel (.xlsx/.xlsm) de-identification
 # Test-only
 pytest>=7.0

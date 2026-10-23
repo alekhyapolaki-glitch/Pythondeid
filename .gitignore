@@ -15,3 +15,5 @@ config/discovered_schema.csv
 # database connections are per machine (server names); template: config/connections.example.yaml
 config/connections.yaml
 config/recommendations.csv
+# real input/output files must never be committed (synthetic examples live in samples/)
+data/

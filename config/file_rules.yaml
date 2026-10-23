@@ -1,0 +1,45 @@
+# ---------------------------------------------------------------------------
+# CSV / Excel de-identification: which files, sheets and columns, and their domains.
+#
+# * Columns use the SAME domains (and policy: full/last4, name method, ...) as the
+#   database rules in deid_rules.yaml, so a value masks identically in files and in SQL Server.
+# * Input / output folders come from paths.yaml (file_input_dir, file_output_dir),
+#   or --input / --output-dir.  Originals are never modified.
+# * Draft this file from your files' headers:  python main.py files-discover
+#   Check it against the files:                python main.py files-validate
+#   Run:                                       python main.py files-run   (--dry-run to test)
+# * Column names match the header text, ignoring upper/lower case and surrounding spaces.
+# ---------------------------------------------------------------------------
+defaults:
+  output_suffix: _deid          # customers.csv -> customers_deid.csv
+  on_missing_column: error      # error | warn   (a configured column is not in the file/sheet)
+  on_value_error: fail          # fail | blank | keep   (a value the masker cannot handle, e.g. a bad date)
+  csv: {delimiter: ",", encoding: utf-8-sig, quotechar: '"'}   # use "\t" for tab-separated files
+  excel: {mode: in_place, header_row: 1}   # in_place keeps formatting/formulas | streaming for huge files
+
+files:
+  - name: customer_extract
+    pattern: "customers*.csv"   # glob within file_input_dir ("**/customers*.csv" to include subfolders)
+    columns:
+      - {name: First Name, domain: first_name}
+      - {name: Last Name, domain: last_name}
+      - {name: Email, domain: email}
+      - {name: SSN, domain: ssn}
+      - {name: Phone, domain: phone}
+      - {name: Address, domain: street_address}
+      - {name: City, domain: city}
+      - {name: Zip, domain: zip}
+      - {name: DOB, domain: person_dates, entity_column: CustomerId}   # same per-person shift as the DB
+      - {name: Account Number, domain: account_number}
+      - {name: Account Name, domain: account_name}
+      - {name: Notes, domain: notes}
+
+  - name: account_report
+    pattern: "accounts*.xlsx"
+    sheets: [Accounts]          # only this sheet; omit to process every sheet
+    columns:
+      - {name: Account Number, domain: account_number}
+      - {name: Account Name, domain: account_name}
+      - {name: Owner SSN, domain: ssn, output_format: dashed}   # format-only override; same masked digits
+      - {name: Card Number, domain: card_number}
+      - {name: Member No, domain: member_no}

@@ -1,9 +1,16 @@
 # File and folder locations used by pythondeid.
 # Relative paths are relative to the project folder (where main.py is), so the tool works from any directory.
-# Absolute paths (e.g. D:\deid\audit) and environment variables (%USERPROFILE%) are allowed.
+# Absolute paths (e.g. D:\deid\audit, \\fileserver\share\in) and environment variables (%USERPROFILE%) are allowed.
+
+# --- database masking
 rules_file: config/deid_rules.yaml            # what to mask (shared with every server)
-audit_dir: audit                              # audit/<run_id>/summary.json, column_results.csv, events.jsonl
+audit_dir: audit                              # audit/<run_id>/summary.json, column_results.csv, file_results.csv
 log_dir: logs                                 # deid.log (rotating)
 discovery_csv: config/discovered_schema.csv   # output of: python main.py discover
 test_vectors: config/test_vectors.csv         # output of: python main.py test-vectors
 recommendations_csv: config/recommendations.csv
+
+# --- file masking (CSV / Excel)
+file_rules: config/file_rules.yaml            # which files/sheets/columns, mapped to the same domains as the DB
+file_input_dir: data/input                    # files to de-identify (originals are never modified)
+file_output_dir: data/output                  # de-identified copies: <name>_deid.csv / .xlsx (same subfolders)

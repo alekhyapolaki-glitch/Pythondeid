@@ -1,0 +1,4 @@
+CustomerId,First Name,Last Name,Email,SSN,Phone,Address,City,Zip,DOB,Account Number,Account Name,Notes
+1,John,Doe,John.Doe@Mail.com,123-45-6789,(555) 123-4567,12 High St,Boston,02118,1980-04-12,ACC-000123-01,JOHN A DOE,"Called from (555) 123-4567, prefers email"
+2,Jane,Smith,jane.smith@corp.org,587-65-4321,555-987-6543,99 Elm Ave,Denver,80202-1234,1975-11-30,ACC-778899-01,ACME DEVELOPMENT INC,SSN 587-65-4321 verified
+3,Ravi,Kumar,ravi.k@mail.com,219-09-9999,+1 555 222 3333,7 Oak Rd,Austin,73301,1990-01-01,ACC-445566-01,RAVI KUMAR REVOCABLE TRUST,

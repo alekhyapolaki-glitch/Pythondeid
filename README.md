@@ -25,6 +25,7 @@ keep working after masking. It is built for SQL Server 2022 and large tables.
 | `config/paths.yaml` | **File/folder locations**: rules file, audit folder, logs, discovery/test-vector CSVs | Usually the same | Yes |
 | `config/settings.yaml` | **How it runs**: batching, workers, key fingerprint, audit options, log level | Yes | Yes |
 | `config/deid_rules.yaml` | **What to mask**: policy, domains, tables | Yes, must be identical | Yes |
+| `config/file_rules.yaml` | **CSV/Excel files**: which files/sheets/columns, mapped to the same domains | Yes | Yes |
 
 * Secrets are in **no** file: the masking key is `DEID_SECRET_KEY`, and SQL passwords go in the
   variable named by each connection's `password_env`.
@@ -33,6 +34,61 @@ keep working after masking. It is built for SQL Server 2022 and large tables.
 * Pick a connection per command: `python main.py -c uat validate`. Without `-c`, the default is used.
 * Relative paths in `paths.yaml` are relative to the project folder, so commands work from any
   directory.
+
+---
+
+## CSV and Excel files
+
+The tool writes de-identified **copies** of CSV (`.csv`, `.txt`, `.tsv`) and Excel (`.xlsx`, `.xlsm`)
+files; the originals are never changed. File columns use the **same domains, policy and key** as the
+database, so a value gets the same masked value in a file as in SQL Server. For example,
+`123-45-6789` becomes the same SSN in `customers.csv` and in `dbo.Customers`.
+
+**Folders (`paths.yaml`):** files are read from `file_input_dir` (default `data\input`) and written to
+`file_output_dir` (default `data\output`) as `<name>_deid.<ext>`, keeping subfolders. `--input` and
+`--output-dir` override them. `data/` is git-ignored, so real files can't be committed.
+
+**Field config (`config/file_rules.yaml`):**
+```yaml
+defaults:
+  output_suffix: _deid
+  on_missing_column: error      # error | warn
+  on_value_error: fail          # fail | blank | keep
+  csv: {delimiter: ",", encoding: utf-8-sig}
+  excel: {mode: in_place, header_row: 1}   # in_place keeps formatting/formulas | streaming for huge files
+files:
+  - name: customer_extract
+    pattern: "customers*.csv"
+    columns:
+      - {name: Email, domain: email}
+      - {name: SSN, domain: ssn}
+      - {name: DOB, domain: person_dates, entity_column: CustomerId}
+  - name: account_report
+    pattern: "accounts*.xlsx"
+    sheets: [Accounts]
+    columns:
+      - {name: Account Number, domain: account_number}
+      - {name: Owner SSN, domain: ssn, output_format: dashed}
+```
+
+```bat
+python main.py files-discover            :: drafts file_rules.yaml from the files' header rows (suggested domains)
+python main.py files-validate            :: checks every configured file/sheet/column exists
+python main.py files-run --dry-run       :: masks everything, writes nothing
+python main.py files-run                 :: writes the de-identified copies
+python main.py files-run --input samples\input --output-dir C:\temp\out   :: try it on the synthetic samples
+```
+
+How it behaves:
+* **Headers:** matched ignoring upper/lower case and surrounding spaces.
+* **CSV:** files are streamed, so any size works.
+* **Excel `in_place`:** keeps formatting, column widths, other sheets and formulas. Formula cells are
+  never changed. Numbers stay numbers and dates stay dates.
+* **Excel `streaming`:** values only; use it for very large workbooks.
+* **Safety:** output is written to a temporary `.part` file and renamed when complete. Existing
+  outputs need `--overwrite`, and an output can never replace its input.
+* **Audit:** `audit\<run_id>\file_results.csv` records per-file SHA-256 fingerprints, row counts
+  and masked-cell counts per column, with no data values.
 
 ---
 
@@ -346,6 +402,9 @@ deid/schema.py             catalog: columns, keys, unique indexes, FKs, sizes, t
 deid/audit.py              DB + file audit trail, checkpoints
 deid/db.py                 pyodbc connections, quoting, retries
 deid/discovery.py          PII heuristics, CSV export, interactive wizard
+deid/files.py              CSV / Excel de-identification (file rules, discovery, processing)
+config/file_rules.yaml     CSV/Excel field config (files, sheets, columns -> domains)
+samples/input/             synthetic example CSV and Excel files
 deid/prompts.py            console questions
 sql/sample_schema.sql      demo DB: cross-table PII, bigint/varchar ids, visits with notes
 tests/                     unit tests + opt-in live SQL Server tests (DEID_IT_SERVER)

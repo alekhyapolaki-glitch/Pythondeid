@@ -407,6 +407,135 @@ def cmd_preview(args):
     return 0
 
 
+# =============================================================================
+# CSV / Excel file de-identification
+# =============================================================================
+def _file_rules(args, settings, rules):
+    from deid.files import load_file_rules
+    return load_file_rules(args.file_rules or settings.paths["file_rules"], rules)
+
+
+def _check_key_pin(settings, keyring):
+    pinned = (settings.security.get("expected_key_fingerprint") or "").strip()
+    if pinned and pinned != keyring.fingerprint():
+        raise ConfigError("DEID_SECRET_KEY does not match security.expected_key_fingerprint (%s, got %s)"
+                          % (pinned, keyring.fingerprint()))
+
+
+def cmd_files_discover(args):
+    """Read the headers of the files in the input folder and draft file_rules.yaml with suggested domains."""
+    from deid.files import draft_file_rules
+    settings = _load(args)
+    rules = load_rules(args.rules)
+    input_dir = args.input or settings.paths["file_input_dir"]
+    if not Path(input_dir).is_dir():
+        print("Input folder %s does not exist. Put your CSV/Excel files there (file_input_dir in paths.yaml) "
+              "or pass --input FOLDER." % input_dir)
+        return 1
+    out = args.out or args.file_rules or settings.paths["file_rules"]
+    if Path(out).exists() and not args.yes and not prompts.ask_yes_no("Overwrite %s?" % out, False):
+        return 1
+    text, n = draft_file_rules(input_dir, rules)
+    Path(out).parent.mkdir(parents=True, exist_ok=True)
+    Path(out).write_text(text, encoding="utf-8")
+    print("Drafted %d file entr%s from the headers in %s -> %s" % (n, "y" if n == 1 else "ies", input_dir, out))
+    print("Review it (domains are guesses from header names), then: python main.py files-validate")
+    return 0
+
+
+def cmd_files_validate(args):
+    """Check the file rules against the actual files: matches, sheets, columns, domains."""
+    from deid.files import find_inputs, read_headers
+    settings = _load(args)
+    rules = load_rules(args.rules)
+    fr = _file_rules(args, settings, rules)
+    input_root = Path(args.input or settings.paths["file_input_dir"])
+    matched, unmatched = find_inputs(str(input_root), fr)
+    problems = 0
+    print("File rules: %s (%d entr%s)" % (fr.source_path, len(fr.files), "y" if len(fr.files) == 1 else "ies"))
+    for path, rule in matched:
+        heads = read_headers(path, int(rule.excel.get("header_row", 1)), rule.csv)
+        sheets = [s for s in heads if s] if not rule.sheets else rule.sheets
+        print("  %s  -> rule '%s'" % (path.name, rule.name))
+        for sheet in (sheets or [""]):
+            header = {h.lower() for h in heads.get(next((k for k in heads if k.lower() == sheet.lower()), sheet), [])}
+            if sheet and not any(k.lower() == sheet.lower() for k in heads):
+                print("      sheet %s: NOT FOUND" % sheet)
+                problems += 1
+                continue
+            for c in rule.columns:
+                dom = rules.domains[c.domain]
+                found = c.name.lower() in header and (not c.entity_column or c.entity_column.lower() in header)
+                setting = ", ".join("%s=%s" % (k, dom.params[k]) for k in ("mode", "method") if k in dom.params)
+                print("      %s%-28s -> %-16s %s%s" % ((sheet + ": ") if sheet else "", c.name, c.domain,
+                                                   ("[%s] " % setting) if setting else "",
+                                                   "" if found else "  <-- NOT FOUND"))
+                problems += 0 if found else 1
+    for path in unmatched:
+        print("  %s  (no matching rule; will be skipped)" % path.name)
+    if not matched:
+        print("No files in %s match the rules." % input_root)
+        return 2
+    print("\nFile rules are VALID" if not problems else "\n%d problem(s) found" % problems)
+    return 0 if not problems else 2
+
+
+def cmd_files_run(args):
+    """De-identify CSV/Excel files into the output folder (originals are never modified)."""
+    from dataclasses import asdict
+    from deid.audit import AuditTrail, new_run_id
+    from deid.files import FileDeidentifier, FileRuleError, find_inputs, output_path_for
+    settings = _load(args)
+    _setup_logging(settings)
+    rules = load_rules(args.rules)
+    keyring = _keyring(settings)
+    _check_key_pin(settings, keyring)
+    fr = _file_rules(args, settings, rules)
+    input_root = Path(args.input or settings.paths["file_input_dir"])
+    output_dir = Path(args.output_dir or settings.paths["file_output_dir"])
+    matched, unmatched = find_inputs(str(input_root), fr)
+    if not matched:
+        print("No files in %s match %s" % (input_root, fr.source_path))
+        return 2
+    print("%s %d file(s): %s -> %s" % ("Dry run of" if args.dry_run else "De-identifying", len(matched),
+                                        input_root, output_dir))
+    for path, rule in matched:
+        print("  %s -> %s  [rule %s: %s]" % (path.name, output_path_for(path, input_root, output_dir, rule).name,
+                                            rule.name, ", ".join("%s->%s" % (c.name, c.domain) for c in rule.columns)))
+    for path in unmatched:
+        print("  %s (no matching rule, skipped)" % path.name)
+    if not args.dry_run and not args.yes and not prompts.ask_yes_no(
+            "Write the de-identified copies to %s? (originals are not changed)" % output_dir, True):
+        print("Aborted.")
+        return 1
+    run_id = new_run_id()
+    audit = AuditTrail(settings.audit, run_id, None)
+    audit.start_run("files-dry-run" if args.dry_run else "files", {
+        "rules_file": str(rules.source_path), "rules_hash": rules.content_hash,
+        "file_rules": str(fr.source_path), "file_rules_hash": fr.content_hash,
+        "key_fingerprint": keyring.fingerprint(), "tool_version": __version__,
+        "input": str(input_root), "output": str(output_dir), "files_planned": len(matched),
+    })
+    deid = FileDeidentifier(rules, fr, keyring)
+    ok = failed = 0
+    for path, rule in matched:
+        try:
+            res = deid.process(path, input_root, output_dir, rule, args.dry_run, args.overwrite)
+            ok += 1
+            print("  OK   %s: %d rows, masked cells %s%s" % (path.name, res.rows, res.masked_cells,
+                                                         ("; " + res.message) if res.message else ""))
+            audit.file_result(asdict(res))
+        except (FileRuleError, MaskerError, OSError, ValueError) as exc:
+            failed += 1
+            print("  FAIL %s: %s" % (path.name, exc))
+            audit.event("ERROR", str(exc), str(path))
+            audit.file_result({"rule": rule.name, "input_path": str(path), "status": "FAILED", "message": str(exc)})
+    status = ("DRY_RUN_OK" if args.dry_run else "SUCCEEDED") if not failed else ("PARTIAL" if ok else "FAILED")
+    audit.end_run(status, "%d ok, %d failed" % (ok, failed), ok, 0)
+    print("\nRun %s: %s (%d ok, %d failed). Audit: %s" % (run_id, status, ok, failed, audit.dir))
+    return 0 if not failed else 2
+
+
 def cmd_list_types(args):
     from deid.advisor import TYPE_GUIDE
     for name in sorted(MASKERS):
@@ -613,6 +742,25 @@ def build_parser():
     tv.add_argument("--out", help="CSV to write (default: test_vectors in paths.yaml)")
     tv.add_argument("--check", metavar="CSV", help="verify this environment reproduces a vectors file")
     tv.set_defaults(func=cmd_test_vectors)
+
+    fd = sub.add_parser("files-discover", help="draft file_rules.yaml from the headers of CSV/Excel input files")
+    fd.add_argument("--input", help="folder with input files (default: file_input_dir in paths.yaml)")
+    fd.add_argument("--out", help="where to write the draft (default: file_rules in paths.yaml)")
+    fd.add_argument("--file-rules", help=argparse.SUPPRESS)
+    fd.set_defaults(func=cmd_files_discover)
+
+    fv = sub.add_parser("files-validate", help="check file rules against the input files (headers, sheets, domains)")
+    fv.add_argument("--input", help="file or folder (default: file_input_dir in paths.yaml)")
+    fv.add_argument("--file-rules", help="file rules YAML (default: file_rules in paths.yaml)")
+    fv.set_defaults(func=cmd_files_validate)
+
+    fr = sub.add_parser("files-run", help="write de-identified copies of CSV/Excel files")
+    fr.add_argument("--input", help="file or folder (default: file_input_dir in paths.yaml)")
+    fr.add_argument("--output-dir", help="output folder (default: file_output_dir in paths.yaml)")
+    fr.add_argument("--file-rules", help="file rules YAML (default: file_rules in paths.yaml)")
+    fr.add_argument("--dry-run", action="store_true", help="read and mask everything, write nothing")
+    fr.add_argument("--overwrite", action="store_true", help="replace existing output files")
+    fr.set_defaults(func=cmd_files_run)
 
     rc = sub.add_parser("recommend", help="data type, format and batch-size recommendations for the rules")
     rc.add_argument("--sample", type=int, default=5000, help="rows sampled per column for format profiling")

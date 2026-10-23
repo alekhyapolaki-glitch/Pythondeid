@@ -167,6 +167,22 @@ class AuditTrail:
             except Exception as exc:  # noqa: BLE001
                 log.error("Could not write column result to audit table: %s", exc)
 
+    FILE_FIELDS = ["run_id", "rule", "format", "status", "input_path", "input_sha256", "output_path",
+                   "output_sha256", "sheets", "rows", "masked_cells", "value_errors", "formulas_skipped",
+                   "seconds", "message"]
+
+    def file_result(self, rec: Dict[str, Any]) -> None:
+        """Per-file outcome of a file de-identification run (no data values, only counts and fingerprints)."""
+        rec = dict({k: None for k in self.FILE_FIELDS}, **rec, run_id=self.run_id)
+        self.summary.setdefault("files", []).append(rec)
+        self._write_summary()
+        with (self.dir / "file_results.csv").open("w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=self.FILE_FIELDS)
+            w.writeheader()
+            for r in self.summary["files"]:
+                w.writerow({k: (json.dumps(r[k]) if isinstance(r.get(k), (dict, list)) else r.get(k))
+                            for k in self.FILE_FIELDS})
+
     # ------------------------------------------------------------------ progress / checkpoints
     def progress_upsert_sql(self) -> str:
         """SQL executed on the *work* connection so the checkpoint commits atomically with the data."""

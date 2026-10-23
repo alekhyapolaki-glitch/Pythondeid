@@ -56,6 +56,9 @@ DEFAULT_PATHS: Dict[str, str] = {
     "discovery_csv": "config/discovered_schema.csv",
     "test_vectors": "config/test_vectors.csv",
     "recommendations_csv": "config/recommendations.csv",
+    "file_rules": "config/file_rules.yaml",
+    "file_input_dir": "data/input",
+    "file_output_dir": "data/output",
 }
 
 # ---------------------------------------------------------------------------
