@@ -290,7 +290,7 @@ Measured in testing: 300k rows / 107 MB, with 2 masked columns and 350k distinct
 ```bat
 cd C:\work\Pythondeid
 state init <your-org>/pythondeid --language python@3.11
-state import requirements.txt          :: pyodbc, pyyaml, pytest
+state import requirements.txt          :: pyodbc, pyyaml, openpyxl, defusedxml (+ requirements-dev.txt for tests)
 state shell                            :: older State Tool versions: state activate
 python -c "import pyodbc, yaml; print('ok')"
 ```
@@ -410,11 +410,34 @@ sql/sample_schema.sql      demo DB: cross-table PII, bigint/varchar ids, visits 
 tests/                     unit tests + opt-in live SQL Server tests (DEID_IT_SERVER)
 ```
 
+## Quality and security status
+
+| Check | Tool | Result |
+|---|---|---|
+| Static security analysis | `bandit -r deid main.py` | **0 issues** (17 SQL-construction findings reviewed and marked `# nosec B608`: identifiers only via `quote_ident()`, values parameterized) |
+| Dependency CVEs | `pip-audit -r requirements.txt` | **No known vulnerabilities** |
+| Lint / bug patterns | `ruff` (pyflakes, bugbear, bandit rules, pylint subset) | **All checks passed** |
+| Tests | `pytest` | Unit, security-regression and live SQL Server 2022 end-to-end tests |
+
+CI (`.github/workflows/ci.yml`) runs all of these on every push, including the end-to-end tests
+against a SQL Server 2022 container. See **SECURITY.md** for the threat model and the production
+checklist.
+
+Performance highlights:
+* **Database:** only distinct values are masked; batches are sized from row size; masking runs in
+  parallel worker processes for large tables.
+* **Files:** CSVs are streamed; distinct values are cached; files over 5 MB are pre-masked in
+  parallel (output is byte-identical to single-process).
+* **Measured:** a 500,000-row × 5-PII-column CSV took about 18 s on 4 CPUs. Format-preserving
+  types cost about 40–75 µs per distinct value (10 HMAC-SHA256 Feistel rounds), and that's
+  deliberately not reduced.
+
 ## 10. Tests
 
 ```bat
-python -m pytest -q
-set DEID_IT_SERVER=localhost & set DEID_IT_PASSWORD=... & python -m pytest -q   :: + live end-to-end tests
+pip install -r requirements-dev.txt     :: or add pytest/ruff/bandit/pip-audit to the ActiveState project
+python -m pytest
+set DEID_IT_SERVER=localhost & set DEID_IT_PASSWORD=... & python -m pytest   :: + live end-to-end tests
 ```
 
 The live tests mask the demo database and check that all integrity counts (joins, member-number

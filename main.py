@@ -15,6 +15,7 @@ Typical flow:
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import logging
 import sys
@@ -516,7 +517,8 @@ def cmd_files_run(args):
         "key_fingerprint": keyring.fingerprint(), "tool_version": __version__,
         "input": str(input_root), "output": str(output_dir), "files_planned": len(matched),
     })
-    deid = FileDeidentifier(rules, fr, keyring)
+    from deid.advisor import resolve_workers
+    deid = FileDeidentifier(rules, fr, keyring, resolve_workers(settings.execution.get("workers", "auto")))
     ok = failed = 0
     for path, rule in matched:
         try:
@@ -525,11 +527,12 @@ def cmd_files_run(args):
             print("  OK   %s: %d rows, masked cells %s%s" % (path.name, res.rows, res.masked_cells,
                                                          ("; " + res.message) if res.message else ""))
             audit.file_result(asdict(res))
-        except (FileRuleError, MaskerError, OSError, ValueError) as exc:
+        except (FileRuleError, MaskerError, OSError, ValueError, csv.Error) as exc:
             failed += 1
             print("  FAIL %s: %s" % (path.name, exc))
             audit.event("ERROR", str(exc), str(path))
             audit.file_result({"rule": rule.name, "input_path": str(path), "status": "FAILED", "message": str(exc)})
+    deid.close()
     status = ("DRY_RUN_OK" if args.dry_run else "SUCCEEDED") if not failed else ("PARTIAL" if ok else "FAILED")
     audit.end_run(status, "%d ok, %d failed" % (ok, failed), ok, 0)
     print("\nRun %s: %s (%d ok, %d failed). Audit: %s" % (run_id, status, ok, failed, audit.dir))
@@ -578,7 +581,7 @@ SAMPLE_INPUTS = {
 
 def cmd_test_vectors(args):
     """Write (or check) known-answer masks so every server/environment can prove it masks identically."""
-    import csv
+
     settings = _load(args)
     keyring = _keyring(settings)
     rules = load_rules(args.rules)
@@ -624,9 +627,9 @@ def cmd_test_vectors(args):
 
 def cmd_recommend(args):
     """Column type/format recommendations, batch sizes for big tables and database readiness."""
-    import csv
+
     from deid.advisor import column_recommendations, database_health, estimate_log_mb
-    settings, rules, engine, info, plan = _plan(args)
+    settings, _rules, engine, _info, plan = _plan(args)
     try:
         print("\n=== Tables: size and update strategy ===")
         print("  %-36s %12s %10s %8s  %-8s %10s %8s" % ("table", "rows", "MB", "B/row", "strategy", "batch", "batches"))
@@ -785,7 +788,7 @@ def main(argv=None) -> int:
         print("\nInterrupted. If a run was in progress, resume it with: python main.py run --resume <run_id>",
               file=sys.stderr)
         return 130
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         from deid.engine import PlanError
         if isinstance(exc, PlanError):
             print("ERROR: %s" % exc, file=sys.stderr)

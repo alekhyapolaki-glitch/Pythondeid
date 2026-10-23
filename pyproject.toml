@@ -1,0 +1,32 @@
+[project]
+name = "pythondeid"
+version = "1.0.0"
+description = "Deterministic, referentially consistent de-identification for SQL Server, CSV and Excel"
+requires-python = ">=3.9"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "S", "UP", "SIM", "PL", "RUF"]
+ignore = [
+  "E501",                              # long SQL / message strings
+  "PLR0911", "PLR0912", "PLR0913", "PLR0915", "PLR0917", "PLR2004",  # complexity heuristics
+  "S101",                              # assert in tests
+  "S608",                              # SQL text: identifiers only via quote_ident(); see SECURITY.md
+  "UP006", "UP007", "UP031", "UP035", "UP045",  # keep Python 3.9-compatible typing / % formatting
+  "B905",                              # zip(strict=) needs Python 3.10
+  "PLC0415",                           # deliberate lazy imports (pyodbc/openpyxl optional)
+  "RUF001", "RUF012", "SIM108", "PLW2901",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S", "PLR", "B017", "RUF043", "SIM"]
+
+[tool.bandit]
+exclude_dirs = ["tests"]

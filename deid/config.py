@@ -31,13 +31,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 # ---------------------------------------------------------------------------
 # connections.yaml - database connections only (one file per machine, not in Git)
 # ---------------------------------------------------------------------------
+# Names of environment variables (not secrets themselves).
+PASSWORD_ENV_DEFAULT = "DEID_DB_PASSWORD"  # noqa: S105  # nosec B105
+SECRET_KEY_ENV_DEFAULT = "DEID_SECRET_KEY"  # noqa: S105  # nosec B105
+
 DEFAULT_CONNECTION: Dict[str, Any] = {
     "driver": "ODBC Driver 18 for SQL Server",
     "server": "localhost",
     "database": "",
     "auth": "windows",  # windows | sql | azure_ad_interactive | azure_ad_password
     "username": "",
-    "password_env": "DEID_DB_PASSWORD",
+    "password_env": PASSWORD_ENV_DEFAULT,
     "encrypt": True,
     "trust_server_certificate": False,
     "login_timeout": 30,
@@ -65,7 +69,7 @@ DEFAULT_PATHS: Dict[str, str] = {
 # settings.yaml - how the tool runs (no connections, no file locations)
 # ---------------------------------------------------------------------------
 DEFAULT_SETTINGS: Dict[str, Any] = {
-    "security": {"secret_key_env": "DEID_SECRET_KEY", "min_key_length": 32, "expected_key_fingerprint": ""},
+    "security": {"secret_key_env": SECRET_KEY_ENV_DEFAULT, "min_key_length": 32, "expected_key_fingerprint": ""},
     "execution": {
         "batch_size": "auto",            # rows per chunk, or "auto" = sized per table (see batching below)
         "fetch_size": 20000,
@@ -133,7 +137,7 @@ def _read_yaml(path: Path) -> Dict[str, Any]:
         with path.open("r", encoding="utf-8") as fh:
             data = yaml.safe_load(fh) or {}
     except yaml.YAMLError as exc:
-        raise ConfigError("Invalid YAML in %s: %s" % (path, exc))
+        raise ConfigError("Invalid YAML in %s: %s" % (path, exc)) from exc
     if not isinstance(data, dict):
         raise ConfigError("%s must contain a mapping at the top level" % path)
     return data
@@ -354,7 +358,7 @@ def _define_domain(domains: Dict[str, DomainRule], name: str, mtype: str, params
         cls = get_masker_class(mtype)
         cls.validate_params(params)
     except MaskerError as exc:
-        raise ConfigError("%s: %s" % (where, exc))
+        raise ConfigError("%s: %s" % (where, exc)) from exc
     new = DomainRule(name, mtype, dict(params))
     old = domains.get(name)
     if old and old.signature() != new.signature():
@@ -418,7 +422,7 @@ def _apply_policy(domains: Dict[str, DomainRule], policy: Dict[str, str], source
                     get_masker_class(d.type).validate_params(d.params)
                 except MaskerError as exc:
                     raise ConfigError("%s: policy.%s=%s cannot apply to domain '%s': %s"
-                                      % (source, key, policy[key], d.name, exc))
+                                      % (source, key, policy[key], d.name, exc)) from exc
 
 
 def parse_rules(raw: Dict[str, Any], source: str = "<rules>") -> Rules:
@@ -487,7 +491,7 @@ def parse_rules(raw: Dict[str, Any], source: str = "<rules>") -> Rules:
                 try:
                     get_masker_class(dom.type).validate_params(dict(dom.params, **overrides))
                 except MaskerError as exc:
-                    raise ConfigError("%s: %s" % (cw, exc))
+                    raise ConfigError("%s: %s" % (cw, exc)) from exc
             entity = str(c.get("entity_column") or "")
             needs_entity = get_masker_class(dom.type).entity_required(get_masker_class(dom.type).validate_params(dom.params))
             if needs_entity and not entity:
@@ -544,7 +548,7 @@ def update_policy_in_file(path: str, policy: Dict[str, str]) -> None:
         at = next((i + 1 for i, ln in enumerate(lines) if ln.startswith("algorithm_version")), None)
         if at is None:
             at = next((i for i, ln in enumerate(lines) if ln.strip() and not ln.lstrip().startswith("#")), len(lines))
-        lines[at:at] = [""] + block + [""]
+        lines[at:at] = ["", *block, ""]
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -601,7 +605,7 @@ def rules_from_csv(path: str) -> Rules:
                 try:
                     params = json.loads(pj)
                 except ValueError as exc:
-                    raise ConfigError("%s line %d: params_json is not valid JSON: %s" % (path, line_no, exc))
+                    raise ConfigError("%s line %d: params_json is not valid JSON: %s" % (path, line_no, exc)) from exc
             schema = (row.get("schema") or "dbo").strip()
             table = row["table"].strip()
             entry = raw_tables.setdefault((schema, table), {"schema": schema, "table": table, "columns": []})

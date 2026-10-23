@@ -10,7 +10,8 @@ defaults:                       # apply to every file entry unless overridden th
   output_suffix: _deid          # customers.csv -> customers_deid.csv
   on_missing_column: error      # error | warn  (configured column not in the file/sheet)
   on_value_error: fail          # fail | blank | keep  (value the masker cannot handle, e.g. bad date)
-  csv: {delimiter: ",", encoding: utf-8-sig, quotechar: '"'}
+  max_file_mb: 2048             # refuse larger inputs
+  csv: {delimiter: ",", encoding: utf-8-sig, quotechar: '"', max_field_kb: 1024}
   excel: {mode: in_place, header_row: 1}   # in_place keeps formatting | streaming for very large files
 files:
   - name: customer_extract
@@ -53,12 +54,16 @@ CSV_EXT = {".csv", ".txt", ".tsv"}
 EXCEL_EXT = {".xlsx", ".xlsm"}
 DEFAULTS: Dict[str, Any] = {
     "output_suffix": "_deid",
+    "max_file_mb": 2048,              # refuse larger inputs (guards against runaway / zip-bomb style files)
     "on_missing_column": "error",
     "on_value_error": "fail",
-    "csv": {"delimiter": ",", "encoding": "utf-8-sig", "quotechar": '"'},
+    "csv": {"delimiter": ",", "encoding": "utf-8-sig", "quotechar": '"', "max_field_kb": 1024},
     "excel": {"mode": "in_place", "header_row": 1},
 }
-CACHE_LIMIT = 500000
+_MISSING = object()
+CACHE_LIMIT = 2000000          # distinct (column, value) masks kept in memory (~300 MB worst case)
+PARALLEL_MIN_BYTES = 5 * 1024 * 1024   # smaller files are faster without starting worker processes
+PARALLEL_BATCH = 5000
 
 
 class FileRuleError(ConfigError):
@@ -84,6 +89,7 @@ class FileRule:
     format: str = ""                     # csv | excel | "" = from the extension
     sheets: List[str] = field(default_factory=list)
     output_suffix: str = "_deid"
+    max_file_mb: int = 2048
     on_missing_column: str = "error"
     on_value_error: str = "fail"
     csv: Dict[str, Any] = field(default_factory=dict)
@@ -143,6 +149,10 @@ def parse_file_rules(raw: Dict[str, Any], rules: Rules, source: str = "<file_rul
             raise FileRuleError("%s: excel.mode must be in_place or streaming" % where)
         if not isinstance(opts["excel"].get("header_row"), int) or opts["excel"]["header_row"] < 1:
             raise FileRuleError("%s: excel.header_row must be a positive integer" % where)
+        if not isinstance(opts["max_file_mb"], int) or opts["max_file_mb"] < 1:
+            raise FileRuleError("%s: max_file_mb must be a positive integer" % where)
+        if not isinstance(opts["csv"].get("max_field_kb"), int) or opts["csv"]["max_field_kb"] < 1:
+            raise FileRuleError("%s: csv.max_field_kb must be a positive integer" % where)
         if len(str(opts["csv"].get("delimiter", ","))) != 1:
             raise FileRuleError("%s: csv.delimiter must be one character (use '\\t' for tab)" % where)
         cols: List[FileColumn] = []
@@ -173,8 +183,8 @@ def parse_file_rules(raw: Dict[str, Any], rules: Rules, source: str = "<file_rul
         if not cols:
             raise FileRuleError("%s: no columns configured" % where)
         out.append(FileRule(name, str(f["pattern"]), cols, fmt, [str(s) for s in (f.get("sheets") or [])],
-                            str(opts["output_suffix"]), opts["on_missing_column"], opts["on_value_error"],
-                            dict(opts["csv"]), dict(opts["excel"])))
+                            str(opts["output_suffix"]), opts["max_file_mb"], opts["on_missing_column"],
+                            opts["on_value_error"], dict(opts["csv"]), dict(opts["excel"])))
     blob = json.dumps(raw, sort_keys=True, default=str).encode("utf-8")
     return FileRules(out, content_hash=hashlib.sha256(blob).hexdigest()[:16])
 
@@ -299,13 +309,17 @@ class FileResult:
 
 
 class FileDeidentifier:
-    def __init__(self, rules: Rules, file_rules: FileRules, keyring: KeyRing):
+    def __init__(self, rules: Rules, file_rules: FileRules, keyring: KeyRing, workers: int = 1):
         self.rules = rules
         self.file_rules = file_rules
         self.keyring = keyring
+        self.workers = max(1, int(workers))
+        self._pool = None
         self.maskers = build_maskers(rules.domains.values(), keyring)
         self._col_maskers: Dict[Tuple[str, str], BaseMasker] = {}
-        self._cache: Dict[Tuple[str, str, Optional[str], str], Optional[str]] = {}
+        self._cache: Dict[Tuple[int, Optional[str], str], Optional[str]] = {}
+        self._cache_ids: Dict[Tuple[str, str], int] = {}  # one small int per distinct (domain, overrides)
+        self._col_ids: Dict[int, int] = {}
 
     def _masker(self, rule: FileRule, col: FileColumn) -> BaseMasker:
         key = (rule.name, col.name)
@@ -315,10 +329,67 @@ class FileDeidentifier:
             self._col_maskers[key] = m
         return m
 
+    def _column_cache_id(self, col: FileColumn) -> int:
+        """Columns with the same domain and format overrides share cached masks (they mask identically)."""
+        cid = self._col_ids.get(id(col))
+        if cid is None:
+            sig = (col.domain, json.dumps(col.overrides, sort_keys=True) if col.overrides else "")
+            cid = self._cache_ids.setdefault(sig, len(self._cache_ids))
+            self._col_ids[id(col)] = cid
+        return cid
+
+    def _cache_key(self, col: FileColumn, text: str, entity: Optional[str]):
+        return (self._column_cache_id(col), entity if col.entity_column else None, text)
+
+    def close(self) -> None:
+        if self._pool is not None:
+            self._pool.close()
+            self._pool = None
+
+    def prewarm(self, rule: FileRule, targets, rows, to_text) -> int:
+        """Mask the distinct values of a large file in parallel worker processes and fill the cache.
+
+        Identical results to in-process masking (same maskers rebuilt from the same domains and key).
+        Values that fail are left out of the cache so the main pass raises the usual error for them.
+        """
+        from .parallel import MaskingPool
+        pending: Dict[Tuple[str, str], Dict[Any, Tuple[str, Optional[str]]]] = {}
+        for values in rows:
+            for col, pos, ent in targets:
+                if pos >= len(values):
+                    continue
+                text = to_text(values[pos])
+                if text is None or text.strip() == "":
+                    continue
+                entity = to_text(values[ent]) if ent is not None and ent < len(values) else None
+                ck = self._cache_key(col, text, entity)
+                if ck not in self._cache:
+                    pending.setdefault((col.name, col.domain), {})[ck] = (text, entity)
+            if sum(len(v) for v in pending.values()) + len(self._cache) >= CACHE_LIMIT:
+                break
+        if not pending:
+            return 0
+        if self._pool is None:
+            self._pool = MaskingPool(self.workers, self.rules.domains.values(), self.keyring)
+        done = 0
+        for (col_name, _), items in pending.items():
+            col = next(c for c in rule.columns if c.name == col_name)
+            keys = list(items)
+            # row ids travel as 8-byte keys (mask_rows passes keys through bytes())
+            batches = [[(i.to_bytes(8, "big"), items[k][0], items[k][1])
+                        for i, k in enumerate(keys[s:s + PARALLEL_BATCH], start=s)]
+                       for s in range(0, len(keys), PARALLEL_BATCH)]
+            for _, results in self._pool.map(self._masker(rule, col), col.overrides, batches, False, parallel=True):
+                for idx, masked, err, _ in results:
+                    if err is None:
+                        self._cache[keys[int.from_bytes(idx, "big")]] = masked
+                        done += 1
+        return done
+
     def mask_text(self, rule: FileRule, col: FileColumn, text: Optional[str], entity: Optional[str]) -> Optional[str]:
         if text is None or text.strip() == "":
             return text
-        ck = (col.domain, json.dumps(col.overrides, sort_keys=True), entity if col.entity_column else None, text)
+        ck = self._cache_key(col, text, entity)
         if ck in self._cache:
             return self._cache[ck]
         out = self._masker(rule, col).mask(text, entity)
@@ -351,33 +422,42 @@ class FileDeidentifier:
         if missing:
             msg = "%s: column(s) not found: %s" % (where, ", ".join(missing))
             if rule.on_missing_column == "error":
-                raise FileRuleError(msg + ". Header is: %s" % ", ".join(str(h) for h in header if h is not None))
+                # The header row is not echoed: with a wrong header_row (or no header) it would be data.
+                raise FileRuleError(msg + " (the header row has %d columns; check header_row and the column "
+                                    "names, or run files-validate)" % sum(1 for h in header if h is not None))
             log.warning(msg)
             res.message = (res.message + "; " if res.message else "") + msg
         return targets
 
     def _apply(self, rule, res, targets, values: List[Any], to_text, from_text, where) -> List[Any]:
         """Mask one row (list of raw values). Entities are read from the ORIGINAL row."""
-        original = list(values)
+        # Hot path (runs for every row): cache lookups inline, row copy only when an entity column is used.
+        original = list(values) if any(ent is not None for _, _, ent in targets) else values
+        cache = self._cache
+        n = len(values)
+        counts = res.masked_cells
         for col, pos, ent in targets:
-            if pos >= len(values):
+            if pos >= n:
                 continue
             raw = original[pos]
             text = to_text(raw)
-            if text is None or text.strip() == "":
+            if not text or text.isspace():
                 continue
-            entity = to_text(original[ent]) if ent is not None and ent < len(original) else None
-            try:
-                masked = self.mask_text(rule, col, text, entity)
-            except MaskerError as exc:
-                res.value_errors += 1
-                if rule.on_value_error == "fail":
-                    raise FileRuleError("%s, column %s: %s" % (where, col.name, exc))
-                masked = None if rule.on_value_error == "blank" else text
-                if rule.on_value_error == "keep":
-                    continue
+            entity = to_text(original[ent]) if ent is not None and ent < n else None
+            ck = (self._column_cache_id(col), entity if col.entity_column else None, text)
+            masked = cache.get(ck, _MISSING)
+            if masked is _MISSING:
+                try:
+                    masked = self.mask_text(rule, col, text, entity)
+                except MaskerError as exc:
+                    res.value_errors += 1
+                    if rule.on_value_error == "fail":
+                        raise FileRuleError("%s, column %s: %s" % (where, col.name, exc)) from None
+                    if rule.on_value_error == "keep":
+                        continue
+                    masked = None
             values[pos] = from_text(raw, masked)
-            res.masked_cells[col.name] = res.masked_cells.get(col.name, 0) + 1
+            counts[col.name] = counts.get(col.name, 0) + 1
         return values
 
     # ------------------------------------------------------------------ csv
@@ -385,12 +465,20 @@ class FileDeidentifier:
         opts = rule.csv
         delimiter = "\t" if src.suffix.lower() == ".tsv" and opts.get("delimiter", ",") == "," else opts["delimiter"]
         enc = opts.get("encoding", "utf-8-sig")
+        csv.field_size_limit(max(csv.field_size_limit(), int(opts.get("max_field_kb", 1024)) * 1024))
         with src.open("r", encoding=enc, newline="") as fin:
             reader = csv.reader(fin, delimiter=delimiter, quotechar=opts.get("quotechar", '"'))
             header = next(reader, None)
             if header is None:
                 raise FileRuleError("%s is empty" % src.name)
             targets = self._resolve_columns(header, rule, src.name, res)
+            if targets and self.workers > 1 and src.stat().st_size >= PARALLEL_MIN_BYTES:
+                # pass 1: distinct values -> parallel masking; pass 2 below reads the file again
+                with src.open("r", encoding=enc, newline="") as pre:
+                    pre_reader = csv.reader(pre, delimiter=delimiter, quotechar=opts.get("quotechar", '"'))
+                    next(pre_reader, None)
+                    n = self.prewarm(rule, targets, pre_reader, lambda v: v)
+                log.info("%s: %d distinct values masked by %d worker processes", src.name, n, self.workers)
             fout = dst.open("w", encoding=enc, newline="") if dst else None
             try:
                 writer = csv.writer(fout, delimiter=delimiter, quotechar=opts.get("quotechar", '"'),
@@ -411,10 +499,14 @@ class FileDeidentifier:
     @staticmethod
     def _openpyxl():
         try:
-            import openpyxl  # noqa: WPS433
+            import openpyxl
         except ImportError:
             raise FileRuleError("Excel support needs the openpyxl library. ActiveState: add the package 'openpyxl' "
-                                "to your project and run 'state pull' (pip: pip install openpyxl)")
+                                "to your project and run 'state pull' (pip: pip install openpyxl)") from None
+        if not getattr(openpyxl, "DEFUSEDXML", False):
+            # Excel files are zipped XML; without defusedxml a crafted file could use XML entity expansion.
+            raise FileRuleError("Excel support requires the 'defusedxml' package (protects against malicious "
+                                "XML in workbooks). ActiveState: add 'defusedxml' and run 'state pull'.")
         return openpyxl
 
     def _sheet_names(self, wb, rule: FileRule, src: Path) -> List[str]:
@@ -446,6 +538,9 @@ class FileDeidentifier:
                 res.sheets.append(name)
                 if not targets:
                     continue
+                if self.workers > 1 and src.stat().st_size >= PARALLEL_MIN_BYTES:
+                    self.prewarm(rule, targets, ([c.value for c in r] for r in ws.iter_rows(min_row=hr + 1)),
+                                 cell_to_text)
                 for row in ws.iter_rows(min_row=hr + 1):
                     values = [c.value for c in row]
                     formulas = {pos for _, pos, _ in targets if pos < len(row) and row[pos].data_type == "f"}
@@ -496,6 +591,10 @@ class FileDeidentifier:
         dst = output_path_for(src, input_root, output_dir, rule)
         res = FileResult(str(src), str(dst), rule.name, fmt)
         t0 = time.time()
+        size_mb = src.stat().st_size / (1024 * 1024)
+        if size_mb > rule.max_file_mb:
+            raise FileRuleError("%s is %.0f MB, above max_file_mb=%d in file_rules.yaml" % (src.name, size_mb,
+                                                                                        rule.max_file_mb))
         if dst.resolve() == src.resolve():
             raise FileRuleError("%s: output would overwrite the input file; use a different file_output_dir or "
                                 "output_suffix" % src)
@@ -583,7 +682,7 @@ def draft_file_rules(input_dir: str, rules: Rules) -> Tuple[str, int]:
         entry.append("    columns:")
         seen = set()
         any_col = False
-        for sheet, cols in headers.items():
+        for cols in headers.values():
             for h in cols:
                 if h.lower() in seen:
                     continue

@@ -67,7 +67,7 @@ class KeyRing:
         self._master = master_key
 
     @classmethod
-    def from_string(cls, secret: str, min_length: int = 32) -> "KeyRing":
+    def from_string(cls, secret: str, min_length: int = 32) -> KeyRing:
         secret = secret.strip()
         if len(secret) < min_length:
             raise MaskerError(
@@ -76,7 +76,7 @@ class KeyRing:
         return cls(secret.encode("utf-8"))
 
     @classmethod
-    def from_env(cls, env_var: str, min_length: int = 32) -> "KeyRing":
+    def from_env(cls, env_var: str, min_length: int = 32) -> KeyRing:
         secret = os.environ.get(env_var)
         if not secret:
             raise MaskerError(
@@ -152,7 +152,7 @@ class BaseMasker:
 
     # -- helpers --------------------------------------------------------------
     def _digest(self, *parts: str) -> bytes:
-        return hmac.new(self._key, "\x1f".join(parts).encode("utf-8"), hashlib.sha256).digest()
+        return hmac.digest(self._key, "\x1f".join(parts).encode("utf-8"), "sha256")
 
     def _int(self, *parts: str) -> int:
         return int.from_bytes(self._digest(*parts), "big")
@@ -446,10 +446,14 @@ class CreditCardMasker(BaseMasker):
 # =============================================================================
 # Keyed tokens
 # =============================================================================
+EMAIL_TOKEN_LENGTH = 16  # 80 bits: collision-safe for hundreds of millions of distinct emails
+
+
 class EmailMasker(BaseMasker):
     type_name = "email"
     description = "Email: deterministic token local-part @ safe domain (case-insensitive, unique)"
-    default_params = {"domain": "example.com", "preserve_domain": False, "prefix": "user", "token_length": 16}
+    default_params = {"domain": "example.com", "preserve_domain": False, "prefix": "user",
+                      "token_length": EMAIL_TOKEN_LENGTH}
     collision_check = True
     injective = True
 
@@ -566,7 +570,7 @@ class FullNameMasker(MethodChoiceMasker):
         if len(tokens) == 1:
             return self._last(tokens[0])
         middle = [_match_case(t, t[0].upper() + ".") if len(t.rstrip(".")) <= 1 else self._first(t) for t in tokens[1:-1]]
-        return " ".join([self._first(tokens[0])] + middle + [self._last(tokens[-1])])
+        return " ".join([self._first(tokens[0]), *middle, self._last(tokens[-1])])
 
     def _first(self, token):
         return _match_case(token, self._pick(data.FIRST_NAMES, "first", token.lower()))
@@ -653,9 +657,7 @@ class AccountNameMasker(FullNameMasker):
         out = []
         for tok in _TOKEN_RE.findall(value):
             w = self._norm(tok)
-            if not tok.strip() or not tok[0].isalnum() or w in data.CONNECTOR_WORDS:
-                out.append(tok)
-            elif w in data.PERSONAL_ENTITY_WORDS or (self.params["keep_industry_words"] and w in self._generic):
+            if not tok.strip() or not tok[0].isalnum() or w in data.CONNECTOR_WORDS or w in data.PERSONAL_ENTITY_WORDS or (self.params["keep_industry_words"] and w in self._generic):
                 out.append(tok)
             elif tok.isdigit():
                 if self.params["keep_numbers"]:
@@ -776,8 +778,12 @@ class DateShiftMasker(BaseMasker):
             return value
         try:
             lead, date, rest, style = self._parse(value)
+        except MaskerError:
+            raise
         except ValueError as exc:
-            raise MaskerError("Invalid date '%s': %s" % (value, exc))
+            # Never include the value itself (errors end up in logs and audit files). datetime's own
+            # messages, e.g. "month must be in 1..12", describe the problem without the data.
+            raise MaskerError("Invalid date: %s" % exc) from None
         gen = self.params["generalize"]
         if gen == "year":
             new = _dt.date(date.year, 1, 1)
@@ -882,7 +888,7 @@ class FreeTextMasker(BaseMasker):
             try:
                 re.compile(cp["regex"])
             except re.error as exc:
-                raise MaskerError("custom_pattern '%s' has an invalid regex: %s" % (cp["name"], exc))
+                raise MaskerError("custom_pattern '%s' has an invalid regex: %s" % (cp["name"], exc)) from exc
             cls._check_action(cp["name"], cp)
 
     @staticmethod
@@ -968,7 +974,7 @@ def get_masker_class(type_name: str) -> Type[BaseMasker]:
     try:
         return MASKERS[type_name]
     except KeyError:
-        raise MaskerError("Unknown mask type '%s'. Available: %s" % (type_name, ", ".join(sorted(MASKERS))))
+        raise MaskerError("Unknown mask type '%s'. Available: %s" % (type_name, ", ".join(sorted(MASKERS)))) from None
 
 
 def create_masker(type_name: str, domain: str, keyring: KeyRing, params: Optional[Dict[str, Any]] = None) -> BaseMasker:
@@ -1008,6 +1014,17 @@ def is_injective(type_name: str, params: Optional[Dict[str, Any]] = None) -> boo
 
 
 __all__ = [
-    "ALGORITHM_VERSION", "KeyRing", "MaskerError", "BaseMasker", "MASKERS", "MODES", "PHONE_MODES", "get_masker_class",
-    "create_masker", "build_maskers", "column_masker", "is_injective", "normalize_entity",
+    "ALGORITHM_VERSION",
+    "MASKERS",
+    "MODES",
+    "PHONE_MODES",
+    "BaseMasker",
+    "KeyRing",
+    "MaskerError",
+    "build_maskers",
+    "column_masker",
+    "create_masker",
+    "get_masker_class",
+    "is_injective",
+    "normalize_entity",
 ]

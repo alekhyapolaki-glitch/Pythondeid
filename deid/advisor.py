@@ -144,18 +144,18 @@ def database_health(conn, largest_single_log_mb: int = 0, total_rows: int = 0) -
         rm, compat, adr, major = cur.fetchone()
         h.facts.update(recovery_model=rm, compatibility_level=compat, accelerated_database_recovery=bool(adr),
                        sql_major_version=major)
-    except Exception as exc:  # noqa: BLE001 - older versions / permissions
+    except Exception as exc:
         log.debug("database facts unavailable: %s", exc)
     try:
         cur.execute("SELECT total_log_size_in_bytes, used_log_space_in_bytes FROM sys.dm_db_log_space_usage")
         total, used = cur.fetchone()
         h.facts.update(log_size_mb=int(total / MB), log_free_mb=int((total - used) / MB))
-    except Exception as exc:  # noqa: BLE001 - needs VIEW DATABASE STATE
+    except Exception as exc:
         log.debug("log usage unavailable: %s", exc)
     try:
         cur.execute("SELECT SUM(unallocated_extent_page_count) * 8 / 1024 FROM tempdb.sys.dm_db_file_space_usage")
         h.facts["tempdb_free_mb"] = int(cur.fetchone()[0] or 0)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         log.debug("tempdb usage unavailable: %s", exc)
 
     if h.facts.get("recovery_model") == "FULL":
@@ -190,7 +190,7 @@ def _pattern(value: str) -> str:
 def profile_column(conn, table: TableInfo, col: ColumnInfo, sample: int = 5000) -> Dict[str, Any]:
     from .engine import text_expr  # local import: engine imports this module
     cur = conn.cursor()
-    cur.execute("SELECT TOP (?) %s FROM %s.%s AS t WHERE t.%s IS NOT NULL" % (
+    cur.execute("SELECT TOP (?) %s FROM %s.%s AS t WHERE t.%s IS NOT NULL" % (  # nosec B608
         text_expr("t", col), quote_ident(table.schema), quote_ident(table.name), quote_ident(col.name)), [sample])
     values = [r[0] for r in cur.fetchall()]
     if not values:
@@ -244,15 +244,15 @@ def column_recommendations(plan, conn, sample: int = 5000) -> List[Dict[str, Any
         families = {c["family"] for c in cols}
         mtype = cols[0]["mask_type"]
         mixed_zero = any(c.get("leading_zero_pct") not in ("", 0, 0.0) for c in cols) and len(cols) > 1
-        if mtype in ("fpe", "account_number", "phone") and cols[0]["params"].get("normalize", "none") != "digits":
-            if len(families) > 1 or mixed_zero:
-                pad = max([c["max_digits"] or 0 for c in cols] + [1])
-                msg = ("domain '%s' is stored as %s across tables%s: set params {normalize: digits, pad_to: %d} so the "
-                       "same number masks identically everywhere" % (
-                           dname, "/".join(sorted(families)), " with leading zeros" if mixed_zero else "", pad))
-                for c in rows:
-                    if c["domain"] == dname:
-                        c["advice"].append(msg)
+        if (mtype in ("fpe", "account_number", "phone") and cols[0]["params"].get("normalize", "none") != "digits"
+                and (len(families) > 1 or mixed_zero)):
+            pad = max([c["max_digits"] or 0 for c in cols] + [1])
+            msg = ("domain '%s' is stored as %s across tables%s: set params {normalize: digits, pad_to: %d} so the "
+                   "same number masks identically everywhere" % (
+                       dname, "/".join(sorted(families)), " with leading zeros" if mixed_zero else "", pad))
+            for c in rows:
+                if c["domain"] == dname:
+                    c["advice"].append(msg)
         if mtype == "ssn":
             pats = {c["top_patterns"].split(" (")[0] for c in cols if c["top_patterns"]}
             if len(pats) > 1:

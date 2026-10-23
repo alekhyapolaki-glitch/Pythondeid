@@ -1,0 +1,6 @@
+# Test and security tooling (not needed at run time)
+-r requirements.txt
+pytest>=7.4
+ruff>=0.6
+bandit>=1.7.9
+pip-audit>=2.7

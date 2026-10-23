@@ -1,6 +1,7 @@
-# Runtime dependencies (ActiveState: add these packages to the project, then `state pull`)
-pyodbc>=4.0.39
-PyYAML>=6.0          # ActiveState may provide it as pyyaml-ft; both work
-openpyxl>=3.1        # Excel (.xlsx/.xlsm) de-identification
-# Test-only
-pytest>=7.0
+# Runtime dependencies.  Minimum versions are the oldest without known CVEs that this tool was
+# tested with; upper bounds avoid untested major releases.  Scan with:  pip-audit -r requirements.txt
+# ActiveState: add these packages to the project (it pins exact versions per commit), then `state pull`.
+pyodbc>=5.2,<6            # SQL Server via ODBC Driver 17/18
+PyYAML>=6.0.1,<7          # config files (safe_load only). ActiveState may ship it as pyyaml-ft: also supported
+openpyxl>=3.1.5,<4        # Excel .xlsx/.xlsm
+defusedxml>=0.7.1,<1      # REQUIRED with openpyxl: blocks XML entity-expansion attacks in workbooks

@@ -5,7 +5,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from deid.maskers import KeyRing  # noqa: E402
+from deid.maskers import KeyRing
 
 
 @pytest.fixture

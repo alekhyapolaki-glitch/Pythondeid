@@ -110,7 +110,7 @@ class AuditTrail:
         self._write_summary()
         if self.db_enabled:
             self.conn.cursor().execute(
-                "INSERT INTO %s (run_id, mode, status, started_at, server_name, database_name, db_login, os_user, "
+                "INSERT INTO %s (run_id, mode, status, started_at, server_name, database_name, db_login, os_user, "  # nosec B608
                 "client_host, tool_version, rules_file, rules_hash, key_fingerprint, resumed_from, tables_planned, "
                 "algorithm_version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)" % self.t("run"),
                 [self.run_id, mode, "RUNNING", _now(), info.get("server"), info.get("database"), info.get("login"),
@@ -130,11 +130,11 @@ class AuditTrail:
         if self.db_enabled:
             try:
                 self.conn.cursor().execute(
-                    "UPDATE %s SET status=?, ended_at=?, message=?, tables_completed=?, rows_updated=? WHERE run_id=?"
+                    "UPDATE %s SET status=?, ended_at=?, message=?, tables_completed=?, rows_updated=? WHERE run_id=?"  # nosec B608
                     % self.t("run"),
                     [status, _now(), message[:4000], tables_completed, rows_updated, self.run_id],
                 )
-            except Exception as exc:  # noqa: BLE001 - never mask the real outcome
+            except Exception as exc:
                 log.error("Could not write run status to audit table: %s", exc)
         self.event("INFO", "Run finished with status %s. %s" % (status, message))
 
@@ -146,10 +146,10 @@ class AuditTrail:
         if self.db_enabled:
             try:
                 self.conn.cursor().execute(
-                    "INSERT INTO %s (run_id, ts, level, object_name, message) VALUES (?,?,?,?,?)" % self.t("event"),
+                    "INSERT INTO %s (run_id, ts, level, object_name, message) VALUES (?,?,?,?,?)" % self.t("event"),  # nosec B608
                     [self.run_id, _now(), level, obj, message],
                 )
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 log.error("Could not write audit event: %s", exc)
 
     def column_result(self, rec: Dict[str, Any]) -> None:
@@ -161,10 +161,10 @@ class AuditTrail:
             values = [rec[c][:4000] if c == "message" and isinstance(rec[c], str) else rec[c] for c in cols]
             try:
                 self.conn.cursor().execute(
-                    "INSERT INTO %s (%s) VALUES (%s)" % (self.t("column_result"), ",".join(cols), ",".join("?" * len(cols))),
+                    "INSERT INTO %s (%s) VALUES (%s)" % (self.t("column_result"), ",".join(cols), ",".join("?" * len(cols))),  # nosec B608
                     values,
                 )
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 log.error("Could not write column result to audit table: %s", exc)
 
     FILE_FIELDS = ["run_id", "rule", "format", "status", "input_path", "input_sha256", "output_path",
@@ -188,7 +188,7 @@ class AuditTrail:
         """SQL executed on the *work* connection so the checkpoint commits atomically with the data."""
         t = self.t("table_progress")
         return (
-            "UPDATE %s SET status=?, last_key=?, rows_updated=rows_updated+?, updated_at=SYSUTCDATETIME() "
+            "UPDATE %s SET status=?, last_key=?, rows_updated=rows_updated+?, updated_at=SYSUTCDATETIME() "  # nosec B608
             "WHERE run_id=? AND schema_name=? AND table_name=?; "
             "IF @@ROWCOUNT = 0 INSERT INTO %s (run_id, schema_name, table_name, status, last_key, rows_updated, updated_at) "
             "VALUES (?,?,?,?,?,?,SYSUTCDATETIME());" % (t, t)
@@ -204,7 +204,7 @@ class AuditTrail:
             return {}
         cur = self.conn.cursor()
         cur.execute(
-            "SELECT schema_name, table_name, status, last_key, rows_updated FROM %s WHERE run_id = ?" % self.t("table_progress"),
+            "SELECT schema_name, table_name, status, last_key, rows_updated FROM %s WHERE run_id = ?" % self.t("table_progress"),  # nosec B608
             [run_id],
         )
         return {
@@ -217,7 +217,7 @@ class AuditTrail:
             return []
         cur = self.conn.cursor()
         cur.execute(
-            "SELECT TOP (?) run_id, mode, status, started_at, ended_at, rules_hash, key_fingerprint, rows_updated, message "
+            "SELECT TOP (?) run_id, mode, status, started_at, ended_at, rules_hash, key_fingerprint, rows_updated, message "  # nosec B608
             "FROM %s ORDER BY started_at DESC" % self.t("run"),
             [limit],
         )
@@ -230,7 +230,7 @@ class AuditTrail:
             return
         t = self.t("table_progress")
         self.conn.cursor().execute(
-            "INSERT INTO %s (run_id, schema_name, table_name, status, last_key, rows_updated, updated_at) "
+            "INSERT INTO %s (run_id, schema_name, table_name, status, last_key, rows_updated, updated_at) "  # nosec B608
             "SELECT ?, src.schema_name, src.table_name, src.status, src.last_key, src.rows_updated, src.updated_at "
             "FROM %s AS src WHERE src.run_id = ? AND NOT EXISTS (SELECT 1 FROM %s AS x WHERE x.run_id = ? "
             "AND x.schema_name = src.schema_name AND x.table_name = src.table_name)" % (t, t, t),

@@ -316,3 +316,16 @@ def test_policy_covers_phone_address_city_zip():
     assert r.domains["street_address"].params["method"] == "hash"
     assert r.domains["city"].params["method"] == "redact"
     assert r.domains["zip"].params["mode"] == "fpe"
+
+
+def test_error_messages_never_contain_values(keyring):
+    """Masker errors are logged and audited, so they must not echo the (sensitive) input."""
+    m = create_masker("date_shift", "d", keyring)
+    for bad in ("SECRET-1980-13-45", "1980-13-45", "not a date 123-45-6789"):
+        with pytest.raises(MaskerError) as err:
+            m.mask(bad)
+        assert bad not in str(err.value) and "123-45-6789" not in str(err.value)
+    n = create_masker("account_number", "n", keyring, {"normalize": "digits", "pad_to": 4})
+    with pytest.raises(MaskerError) as err:
+        n.mask("98765432")
+    assert "98765432" not in str(err.value)

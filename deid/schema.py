@@ -199,14 +199,14 @@ class SchemaCatalog:
 
     # ------------------------------------------------------------------ loading
     @classmethod
-    def load(cls, conn, schemas: Optional[List[str]] = None) -> "SchemaCatalog":
+    def load(cls, conn, schemas: Optional[List[str]] = None) -> SchemaCatalog:
         cat = cls()
         cur = conn.cursor()
-        schema_filter = ""
-        params: List[str] = []
-        if schemas:
-            schema_filter = " AND s.name IN (%s)" % ",".join("?" * len(schemas))
-            params = list(schemas)
+        # Static SQL only; the optional schema filter is applied in Python (catalog views are small).
+        wanted = {x.lower() for x in schemas} if schemas else None
+
+        def keep(schema_name: str) -> bool:
+            return wanted is None or schema_name.lower() in wanted
 
         cur.execute(
             """
@@ -215,11 +215,12 @@ class SchemaCatalog:
             FROM sys.tables t
             JOIN sys.schemas s ON s.schema_id = t.schema_id
             JOIN sys.columns c ON c.object_id = t.object_id
-            WHERE t.is_ms_shipped = 0""" + schema_filter + """
-            ORDER BY s.name, t.name, c.column_id""",
-            params,
+            WHERE t.is_ms_shipped = 0
+            ORDER BY s.name, t.name, c.column_id"""
         )
         for row in cur.fetchall():
+            if not keep(row[0]):
+                continue
             t = cat.get(row[0], row[1])
             if t is None:
                 t = TableInfo(row[0], row[1])
@@ -239,9 +240,8 @@ class SchemaCatalog:
             JOIN sys.schemas s ON s.schema_id = t.schema_id
             JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
             JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
-            WHERE i.is_unique = 1 AND ic.is_included_column = 0""" + schema_filter + """
-            ORDER BY s.name, t.name, i.index_id, ic.key_ordinal""",
-            params,
+            WHERE i.is_unique = 1 AND ic.is_included_column = 0
+            ORDER BY s.name, t.name, i.index_id, ic.key_ordinal"""
         )
         sets: Dict[Tuple[str, str, str], IndexInfo] = {}
         for schema, table, index, is_pk, col, is_uc, itype, is_dis, ref in cur.fetchall():
@@ -268,9 +268,7 @@ class SchemaCatalog:
             FROM sys.tables t
             JOIN sys.schemas s ON s.schema_id = t.schema_id
             JOIN sys.partitions p ON p.object_id = t.object_id AND p.index_id IN (0, 1)
-            WHERE 1 = 1""" + schema_filter + """
-            GROUP BY s.name, t.name, t.object_id""",
-            params,
+            GROUP BY s.name, t.name, t.object_id"""
         )
         for schema, table, rows, pages in cur.fetchall():
             t = cat.get(schema, table)

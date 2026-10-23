@@ -201,7 +201,7 @@ def build_plan(catalog: SchemaCatalog, rules: Rules, execution: Dict[str, Any], 
     while queue:
         (s, t), c = queue.pop(0)
         domain = targets[(s, t)][c][0]
-        for fk, side, os_, ot, oc in catalog.fks_touching(s, t, c):
+        for fk, _side, os_, ot, oc in catalog.fks_touching(s, t, c):
             fks[(fk.schema.lower(), fk.name.lower())] = fk
             if fk.update_action == 1:
                 errors.append(
@@ -376,7 +376,7 @@ def key_expr(alias: str, cp: ColumnPlan) -> str:
 def distinct_values_sql(tp: TablePlan, cp: ColumnPlan) -> str:
     entity = (", MIN(%s) AS e" % text_expr("t", cp.entity_info)) if cp.entity_info is not None else ""
     return (
-        "SELECT %s AS h, MIN(%s) AS v%s FROM %s AS t WHERE t.%s IS NOT NULL GROUP BY %s"
+        "SELECT %s AS h, MIN(%s) AS v%s FROM %s AS t WHERE t.%s IS NOT NULL GROUP BY %s"  # nosec B608
         % (key_expr("t", cp), text_expr("t", cp.info), entity, tp.sql_name, quote_ident(cp.name), key_expr("t", cp))
     )
 
@@ -401,12 +401,12 @@ def update_sql(tp: TablePlan, ranged: bool, lower_bound: bool) -> str:
     if ranged:
         qk = quote_ident(tp.key_columns[0])
         where += (" AND t.%s > ? AND t.%s <= ?" % (qk, qk)) if lower_bound else (" AND t.%s <= ?" % qk)
-    return "UPDATE t SET %s FROM %s AS t %s WHERE %s" % (", ".join(sets), tp.sql_name, " ".join(joins), where)
+    return "UPDATE t SET %s FROM %s AS t %s WHERE %s" % (", ".join(sets), tp.sql_name, " ".join(joins), where)  # nosec B608
 
 
 def chunk_bound_sql(tp: TablePlan, lower_bound: bool) -> str:
     qk = quote_ident(tp.key_columns[0])
-    return "SELECT MAX(x.k) FROM (SELECT TOP (?) t.%s AS k FROM %s AS t %s ORDER BY t.%s) AS x" % (
+    return "SELECT MAX(x.k) FROM (SELECT TOP (?) t.%s AS k FROM %s AS t %s ORDER BY t.%s) AS x" % (  # nosec B608
         qk, tp.sql_name, ("WHERE t.%s > ?" % qk) if lower_bound else "", qk)
 
 
@@ -512,8 +512,8 @@ class Engine:
             try:
                 if c is not None:
                     c.close()
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:
+                log.debug("Closing a connection failed: %s", exc.__class__.__name__)
 
     def plan(self) -> Plan:
         catalog = SchemaCatalog.load(self.read)
@@ -597,7 +597,7 @@ class Engine:
                 try:
                     total_rows += self._process_table(tp, run_id, dry_run, audit, prog)
                     completed += 1
-                except Exception as exc:  # noqa: BLE001 - recorded, then optionally stop
+                except Exception as exc:
                     failures.append("%s: %s" % (tp.fqn, exc))
                     log.error("Table %s failed: %s", tp.fqn, exc)
                     audit.event("ERROR", str(exc), tp.fqn)
@@ -615,8 +615,8 @@ class Engine:
                 audit.save_state(state)
             try:
                 self.work.rollback()
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:
+                log.debug("Final rollback failed: %s", exc.__class__.__name__)
 
         if dry_run:
             status = "DRY_RUN_OK" if not failures else "DRY_RUN_ISSUES"
@@ -659,7 +659,7 @@ class Engine:
                     raise RuntimeError("constraint is still disabled/untrusted")
                 audit.event("INFO", "Re-enabled and validated FK %s (WITH CHECK)" % f["name"], target)
                 log.info("Re-enabled and validated FK %s", f["name"])
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 self.work.rollback()
                 remaining.append(f)
                 msg = "FK %s on %s failed validation after masking: %s" % (f["name"], target, exc)
@@ -738,7 +738,7 @@ class Engine:
                 try:
                     self.work.cursor().execute("ENABLE TRIGGER %s ON %s" % (qualified(tp.info.schema, trg), tp.sql_name))
                     self.work.commit()
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     audit.event("ERROR", "Could not re-enable trigger %s: %s" % (trg, exc), tp.fqn)
             if triggers:
                 audit.event("INFO", "Re-enabled triggers: %s" % ", ".join(triggers), tp.fqn)
@@ -754,7 +754,7 @@ class Engine:
     def _counts(self, tp: TablePlan) -> Dict[int, int]:
         cur = self.read.cursor()
         exprs = ["COUNT_BIG(*)"] + ["COUNT_BIG(%s)" % quote_ident(cp.name) for cp in tp.columns]
-        cur.execute("SELECT %s FROM %s" % (", ".join(exprs), tp.sql_name))
+        cur.execute("SELECT %s FROM %s" % (", ".join(exprs), tp.sql_name))  # nosec B608
         row = cur.fetchone()
         out = {0: int(row[0])}
         for cp, v in zip(tp.columns, row[1:]):
@@ -763,7 +763,7 @@ class Engine:
 
     def _distinct_count(self, tp: TablePlan, cp: ColumnPlan) -> int:
         cur = self.read.cursor()
-        cur.execute("SELECT COUNT_BIG(*) FROM (SELECT 1 AS x FROM %s AS t WHERE t.%s IS NOT NULL GROUP BY %s) AS z"
+        cur.execute("SELECT COUNT_BIG(*) FROM (SELECT 1 AS x FROM %s AS t WHERE t.%s IS NOT NULL GROUP BY %s) AS z"  # nosec B608
                     % (tp.sql_name, quote_ident(cp.name), hash_expr("t", cp.info)))
         return int(cur.fetchone()[0])
 
@@ -848,8 +848,8 @@ class Engine:
         try:
             self.work.cursor().execute("IF OBJECT_ID('tempdb..#deid_map') IS NOT NULL DROP TABLE #deid_map")
             self.work.commit()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:
+            log.warning("Could not drop #deid_map: %s", exc.__class__.__name__)
 
     def _retry(self, fn, what):
         return with_retry(fn, self.work, int(self.ex.get("max_retries", 3)),

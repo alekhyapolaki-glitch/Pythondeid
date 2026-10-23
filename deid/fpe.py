@@ -34,18 +34,18 @@ class FeistelCipher:
     def _prf(self, message: bytes, modulus: int) -> int:
         """HMAC-SHA256 based PRF, extended with a counter to cover large moduli."""
         needed = (modulus.bit_length() + 7) // 8 + 8
+        if needed <= 32:  # common case (up to ~57 digits): a single block
+            return int.from_bytes(hmac.digest(self._key, b"\x00\x00\x00\x00" + message, "sha256")[:needed],
+                                  "big") % modulus
         out = b""
         counter = 0
         while len(out) < needed:
-            out += hmac.new(self._key, counter.to_bytes(4, "big") + message, hashlib.sha256).digest()
+            out += hmac.digest(self._key, counter.to_bytes(4, "big") + message, "sha256")
             counter += 1
         return int.from_bytes(out[:needed], "big") % modulus
 
     def _round_value(self, tweak: bytes, rnd: int, n: int, radix: int, b_len: int, b_val: int, modulus: int) -> int:
-        msg = b"|".join(
-            [tweak, str(rnd).encode(), str(n).encode(), str(radix).encode(), str(b_len).encode(), str(b_val).encode()]
-        )
-        return self._prf(msg, modulus)
+        return self._prf(b"%b|%d|%d|%d|%d|%d" % (tweak, rnd, n, radix, b_len, b_val), modulus)
 
     @staticmethod
     def _num(symbols: Sequence[int], radix: int) -> int:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import getpass
 import logging
 import os
+import re
 import time
 from typing import Any, Callable, Dict, Optional, TypeVar
 
@@ -18,7 +19,7 @@ class DatabaseError(Exception):
 
 def _pyodbc():
     try:
-        import pyodbc  # noqa: WPS433 - imported lazily so offline commands work without it
+        import pyodbc
     except ImportError as exc:  # pragma: no cover
         raise DatabaseError(
             "pyodbc is not installed in this runtime. With the ActiveState State Tool run: state install pyodbc"
@@ -27,9 +28,14 @@ def _pyodbc():
 
 
 def quote_ident(name: str) -> str:
-    """Quote a SQL Server identifier: my]col -> [my]]col]."""
-    if name is None or name == "":
+    """Quote a SQL Server identifier: my]col -> [my]]col].
+
+    This is the ONLY way identifiers enter SQL text in this tool; every data value is a ? parameter.
+    """
+    if not isinstance(name, str) or name == "":
         raise ValueError("Empty SQL identifier")
+    if len(name) > 128 or "\x00" in name:
+        raise ValueError("Invalid SQL identifier (longer than 128 characters or contains NUL)")
     return "[" + name.replace("]", "]]") + "]"
 
 
@@ -67,6 +73,10 @@ def build_connection_string(db: Dict[str, Any], password: Optional[str] = None) 
         parts["Authentication"] = "ActiveDirectoryInteractive"
         parts["UID"] = db["username"]
     for k, v in (db.get("extra") or {}).items():
+        if not re.match(r"^[A-Za-z][A-Za-z0-9 _]{0,63}$", str(k)):
+            raise DatabaseError("Invalid ODBC keyword %r in connection 'extra'" % k)
+        if str(k).upper() in ("PWD", "PASSWORD", "UID", "DRIVER"):
+            raise DatabaseError("'extra' may not set %s; use the dedicated connection settings" % k)
         parts[str(k)] = v
     return ";".join("%s=%s" % (k, v if k == "DRIVER" else _odbc_value(v)) for k, v in parts.items()) + ";"
 
@@ -96,7 +106,7 @@ class ConnectionFactory:
         try:
             conn = pyodbc.connect(cs, autocommit=autocommit, timeout=int(self.db.get("login_timeout") or 30))
         except pyodbc.Error as exc:
-            raise DatabaseError("Could not connect to %s/%s: %s" % (self.db["server"], self.db["database"], exc))
+            raise DatabaseError("Could not connect to %s/%s: %s" % (self.db["server"], self.db["database"], exc)) from exc
         if self.db.get("query_timeout"):
             conn.timeout = int(self.db["query_timeout"])
         return conn
@@ -117,11 +127,11 @@ def with_retry(fn: Callable[[], T], conn, retries: int, backoff: float, what: st
     while True:
         try:
             return fn()
-        except Exception as exc:  # noqa: BLE001 - re-raised below when not transient
+        except Exception as exc:
             try:
                 conn.rollback()
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as rb_exc:
+                log.debug("Rollback after error failed: %s", rb_exc.__class__.__name__)
             if attempt >= retries or not is_transient(exc):
                 raise
             attempt += 1
