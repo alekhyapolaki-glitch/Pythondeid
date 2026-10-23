@@ -1,0 +1,74 @@
+# ---------------------------------------------------------------------------
+# What to de-identify.
+#
+# domains:  named masking definitions.  Every column that uses the same domain
+#           is masked with the same algorithm + parameters + derived key, so a
+#           value (e.g. an SSN) gets the SAME masked value in every table.
+#           => give columns that join to each other the same domain.
+# tables:   table -> list of columns -> domain.
+#           Inline form is also allowed:  {name: Col, type: email, params: {...}}
+#           key_columns: optional unique NOT NULL column used for batched updates
+#           when the table has no primary key.
+#
+# Mask types: python main.py list-types
+# Build this file interactively:  python main.py wizard
+#   ... or from a CSV:            python main.py discover  ->  edit  ->  import-csv
+# ---------------------------------------------------------------------------
+domains:
+  email:
+    type: email
+    params: {domain: example.com, token_length: 12}
+  ssn:
+    type: ssn
+    params: {output_format: preserve, realistic: true}
+  account_number:
+    type: account_number
+    params: {preserve_last: 0}
+  card_number:
+    type: credit_card
+    params: {preserve_first: 6}
+  phone:
+    type: phone
+  first_name: {type: first_name}
+  last_name: {type: last_name}
+  street_address: {type: street_address}
+  city: {type: city}
+  zip:
+    type: zip
+    params: {mode: truncate, keep_digits: 3}
+  dob:
+    type: date_shift
+    params: {max_days: 180}
+
+tables:
+  - schema: dbo
+    table: Customers
+    columns:
+      - {name: FirstName, domain: first_name}
+      - {name: LastName, domain: last_name}
+      - {name: Email, domain: email}
+      - {name: SSN, domain: ssn}
+      - {name: Phone, domain: phone}
+      - {name: Street, domain: street_address}
+      - {name: City, domain: city}
+      - {name: Zip, domain: zip}
+      - {name: DateOfBirth, domain: dob}
+
+  - schema: dbo
+    table: Accounts
+    columns:
+      - {name: AccountNumber, domain: account_number}   # primary key, referenced by Transactions
+      - {name: OwnerSSN, domain: ssn}                    # same domain as Customers.SSN => joins still work
+      - {name: CardNumber, domain: card_number}
+
+  - schema: dbo
+    table: Transactions
+    columns:
+      - {name: AccountNumber, domain: account_number}   # FK -> Accounts.AccountNumber
+      - {name: NotifyEmail, domain: email}
+
+  - schema: dbo
+    table: MarketingContacts                          # heap without PK: single-statement strategy
+    columns:
+      - {name: Email, domain: email}
+      - {name: Notes, type: redact}

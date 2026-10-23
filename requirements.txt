@@ -1,0 +1,5 @@
+# Runtime dependencies (ActiveState: `state install pyodbc` + `state install pyyaml`, or `state import requirements.txt`)
+pyodbc>=4.0.39
+PyYAML>=6.0
+# Test-only
+pytest>=7.0

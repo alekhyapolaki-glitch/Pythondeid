@@ -1,0 +1,43 @@
+# ---------------------------------------------------------------------------
+# pythondeid environment settings.  NO secrets in this file:
+#   * DB password      -> environment variable named by database.password_env
+#   * masking key      -> environment variable named by security.secret_key_env
+# Re-create interactively with:  python main.py configure
+# ---------------------------------------------------------------------------
+database:
+  driver: ODBC Driver 18 for SQL Server     # or "ODBC Driver 17 for SQL Server"
+  server: localhost                          # host, host,port  or  host\INSTANCE
+  database: DeidDemo
+  auth: windows                              # windows | sql | azure_ad_interactive | azure_ad_password
+  username: ''                               # required for sql / azure_ad_* auth
+  password_env: DEID_DB_PASSWORD
+  encrypt: true
+  trust_server_certificate: true             # set false when the server has a trusted certificate
+  login_timeout: 30
+  query_timeout: 0                           # seconds, 0 = no limit
+  application_name: pythondeid
+  extra: {}                                  # any extra ODBC keywords, e.g. {MultiSubnetFailover: 'yes'}
+
+security:
+  secret_key_env: DEID_SECRET_KEY            # SAME key every run => same masks across tables/DBs/runs
+  min_key_length: 32
+
+execution:
+  batch_size: 50000                # rows per committed chunk (chunked strategy)
+  fetch_size: 5000                 # distinct values per round trip when building the mask map
+  disable_triggers: true           # disable enabled triggers on a table while it is masked
+  auto_include_fk_columns: true    # mask FK partner columns with the same domain automatically
+  stop_on_error: true              # stop at the first failed table (FKs stay disabled until resume)
+  collision_check: true            # detect two inputs producing the same token (email/hash/card)
+  max_retries: 3                   # retries for deadlocks / lock timeouts
+  retry_backoff_seconds: 2
+  allow_single_statement_rows: 50000000   # warn above this size for one-transaction updates
+
+audit:
+  write_to_db: true                # audit tables in the schema below (also needed for resumable chunks)
+  schema: deid_audit
+  output_dir: audit                # local copy: audit/<run_id>/summary.json, column_results.csv, events.jsonl
+
+logging:
+  level: INFO
+  dir: logs

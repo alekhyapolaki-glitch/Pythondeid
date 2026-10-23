@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+# run outputs (contain no original PII, but are environment specific)
+logs/*
+!logs/.gitkeep
+audit/*
+!audit/.gitkeep
+config/discovered_schema.csv
+# never commit secrets
+.env
+*.key
