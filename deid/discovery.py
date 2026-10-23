@@ -59,6 +59,7 @@ def export_schema_csv(catalog: SchemaCatalog, path: str, only_suggested: bool = 
                     "max_length": c.max_chars if c.max_chars is not None else "", "is_nullable": int(c.is_nullable),
                     "is_primary_key": int(c.name.lower() in pk), "suggested_type": sug,
                     "mask_type": "", "domain": "", "params_json": "",
+                    "expected_input_type": c.type_display(), "output_type": "", "entity_column": "",
                 })
                 rows += 1
     return rows
@@ -115,11 +116,29 @@ def run_wizard(catalog: SchemaCatalog, existing: Optional[Rules] = None) -> Rule
             default_domain = existing_same[0].name if existing_same else mtype
             dname = prompts.ask("    Domain name", default_domain)
             if dname not in domains:
-                params = _ask_params(mtype)
+                params = _ask_key_questions(mtype, c, domains)
+                params.update(_ask_params(mtype, skip=set(params)))
                 domains[dname] = DomainRule(dname, mtype, params)
             elif domains[dname].type != mtype:
                 print("    Domain '%s' is already a '%s' domain; using that definition." % (dname, domains[dname].type))
-            cols.append(ColumnRule(c.name, dname))
+            dom = domains[dname]
+            rule = ColumnRule(c.name, dname, expected_input_type=c.type_display())
+            if dom.params.get("shift_by") == "entity":
+                others = [x.name for x in t.ordered_columns() if x.name != c.name and x.family != "other"]
+                pk = [k.lower() for k in t.primary_key]
+                default_ent = next((x for x in others if re.search(
+                    r"(person|patient|customer|member|employee|client|subject).*id$", x.lower()) and x.lower() not in pk),
+                    next((x for x in others if x.lower().endswith("id") and x.lower() not in pk), others[0]))
+                rule.entity_column = prompts.choose("    Which column identifies the person in %s?" % t.name,
+                                                    others, default_ent)
+            fmt = get_masker_class(dom.type).format_params
+            if "output_format" in fmt and prompts.ask_yes_no("    Use a different output format for this column?", False):
+                opts = ["preserve", "dashed", "digits"] if dom.type == "ssn" else ["preserve", "digits", "grouped"]
+                rule.overrides["output_format"] = prompts.choose("    Output format", opts, "preserve")
+            out_type = prompts.ask("    Expected OUTPUT data type (Enter = same as column %s)" % c.type_display(),
+                                   "", required=False)
+            rule.output_type = out_type
+            cols.append(rule)
         if cols:
             key_cols: List[str] = []
             if not t.primary_key:
@@ -139,15 +158,57 @@ def run_wizard(catalog: SchemaCatalog, existing: Optional[Rules] = None) -> Rule
     return rules
 
 
-def _ask_params(mtype: str) -> Dict[str, object]:
+def _ask_key_questions(mtype: str, col: ColumnInfo, domains: Dict[str, DomainRule]) -> Dict[str, object]:
+    """The decisions that matter most per type, asked in plain language."""
+    p: Dict[str, object] = {}
+    if mtype in ("ssn", "account_number"):
+        p["mode"] = prompts.choose("    De-identify fully, or keep the last 4 characters?", ["full", "last4"], "full")
+    elif mtype == "credit_card":
+        p["mode"] = prompts.choose("    Card numbers: full, last4, or first6_last4 (PCI display)?",
+                                   ["full", "last4", "first6_last4"], "full")
+    if mtype in ("account_number", "fpe") and prompts.ask_yes_no(
+            "    Is this identifier stored as a NUMBER in some tables and as text/zero-padded in others?",
+            col.family in ("int", "decimal")):
+        p["normalize"] = "digits"
+        p["pad_to"] = prompts.ask_int("    Maximum number of digits the identifier can have", 12, 1)
+    if mtype == "date_shift":
+        if prompts.ask_yes_no("    Shift all dates of the same person by the same offset (keeps intervals)?", True):
+            p["shift_by"] = "entity"
+        p["max_days"] = prompts.ask_int("    Maximum shift in days (+/-)", 365, 1)
+    if mtype == "free_text":
+        p["mode"] = prompts.choose("    Free text handling", ["scrub", "redact", "nullify", "hash"], "scrub")
+        if p["mode"] == "scrub":
+            detectors: Dict[str, Dict[str, str]] = {}
+            for det in ("email", "ssn", "credit_card", "phone", "ip_address", "date"):
+                linkable = [d.name for d in domains.values() if d.type == {"credit_card": "credit_card"}.get(det, det)]
+                options = ["tag", "remove", "skip"] + (["mask"] if linkable else [])
+                action = prompts.choose("    %s found in the text ->" % det, options,
+                                        "mask" if linkable else ("skip" if det in ("ip_address", "date") else "tag"))
+                if action == "skip":
+                    continue
+                spec = {"action": action}
+                if action == "mask":
+                    spec["domain"] = prompts.choose("      mask with domain", linkable, linkable[0])
+                elif action == "tag":
+                    spec["tag"] = "[%s]" % det.upper()
+                detectors[det] = spec
+            p["detectors"] = detectors
+            p["on_overflow"] = prompts.choose("    If scrubbed text no longer fits the column", ["truncate", "error"],
+                                              "truncate")
+    return p
+
+
+def _ask_params(mtype: str, skip=frozenset()) -> Dict[str, object]:
     cls = get_masker_class(mtype)
-    if not cls.default_params:
+    simple = {k: v for k, v in cls.default_params.items()
+              if k not in skip and not isinstance(v, (dict, list)) and k not in ("normalize", "pad_to", "shift_by")}
+    if not simple:
         return {}
     print("    %s - %s" % (mtype, cls.description))
-    if not prompts.ask_yes_no("    Customise parameters %s?" % cls.default_params, False):
+    if not prompts.ask_yes_no("    Customise other parameters %s?" % simple, False):
         return {}
     params: Dict[str, object] = {}
-    for name, default in cls.default_params.items():
+    for name, default in simple.items():
         if isinstance(default, bool):
             val: object = prompts.ask_yes_no("      %s" % name, default)
         elif isinstance(default, int):

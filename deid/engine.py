@@ -4,17 +4,22 @@ How an update works (per table)
 -------------------------------
 1. For every target column, read the DISTINCT original values (grouped by their
    SHA-256 hash, so case/trailing-space variants are never merged) on a
-   separate read connection.
-2. Mask each distinct value in Python (deterministic per domain), validate the
-   result fits the column, check for collisions, and bulk-load
+   separate read connection.  For per-person date shifting the grouping key is
+   (person id, date).
+2. Mask each distinct value (deterministic per domain; optionally in parallel
+   worker processes), validate the result fits the column and the configured
+   ``output_type``, check for collisions, and bulk-load
    ``(column ordinal, sha256(original), masked)`` into a session temp table
    ``#deid_map``.  Original values are never written anywhere.
 3. A set-based ``UPDATE ... FROM table LEFT JOIN #deid_map`` rewrites the table:
    * strategy ``chunked`` - key ranges of a single-column, unmasked key, one
-     transaction per chunk with an atomic checkpoint (resumable);
+     transaction per chunk with an atomic checkpoint (resumable).  The chunk
+     size is sized from the table's average row size (``batch_size: auto``).
+     Masked columns covered by nonclustered unique indexes are allowed: those
+     indexes are disabled for the update and rebuilt (re-validated) afterwards.
    * strategy ``single`` - one statement / one transaction, used when the key
-     itself is masked, a masked column is unique, or no usable key exists
-     (avoids transient duplicate-key errors and double masking).
+     itself is masked, a masked column is in the PK/clustered or an FK-referenced
+     unique index, or no usable key exists.
 
 Run-level safety
 ----------------
@@ -32,7 +37,6 @@ from __future__ import annotations
 
 import datetime as _dt
 import decimal
-import hashlib
 import json
 import logging
 import time
@@ -41,16 +45,20 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import __version__
+from .advisor import estimate_log_mb, recommend_batch_size, resolve_workers
 from .audit import AuditTrail, new_run_id
-from .config import DomainRule, Rules, Settings
+from .config import ColumnRule, DomainRule, Rules, Settings
 from .db import qualified, quote_ident, server_info, with_retry
-from .maskers import BaseMasker, KeyRing, MaskerError, create_masker, get_masker_class, is_injective
-from .schema import INT_RANGES, ColumnInfo, ForeignKey, SchemaCatalog, TableInfo, enabled_triggers, fk_status
+from .maskers import ALGORITHM_VERSION, BaseMasker, KeyRing, build_maskers, column_masker, get_masker_class, is_injective
+from .parallel import MaskingPool
+from .schema import (INT_RANGES, ColumnInfo, ForeignKey, IndexInfo, SchemaCatalog, TableInfo, enabled_triggers,
+                     fk_status, index_disabled, parse_type, same_type)
 
 log = logging.getLogger("deid.engine")
 
 MAP_MASKED_MAX = 4000
 MAX_REPORTED_ERRORS = 10
+PARALLEL_MIN_ROWS = 100000
 
 
 class PlanError(Exception):
@@ -70,6 +78,10 @@ class ColumnPlan:
     domain: DomainRule
     ordinal: int
     auto_added: bool = False
+    entity_info: Optional[ColumnInfo] = None
+    output_info: Optional[ColumnInfo] = None
+    overrides: Dict[str, Any] = field(default_factory=dict)
+    expected_input_type: str = ""
 
     @property
     def name(self) -> str:
@@ -86,6 +98,8 @@ class TablePlan:
     columns: List[ColumnPlan]
     key_columns: List[str] = field(default_factory=list)
     strategy: str = "single"
+    batch_size: int = 0
+    disable_indexes: List[IndexInfo] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
 
     @property
@@ -116,12 +130,29 @@ class Plan:
         lines = ["De-identification plan: %d table(s), %d column(s)" % (
             len(self.tables), sum(len(t.columns) for t in self.tables))]
         for tp in self.tables:
-            lines.append("  %s  [~%d rows, strategy=%s, key=%s]" % (
-                tp.fqn, tp.info.row_count, tp.strategy, ",".join(tp.key_columns) or "-"))
+            size_mb = tp.info.data_bytes / 1048576.0
+            if tp.strategy == "chunked":
+                chunks = -(-tp.info.row_count // max(tp.batch_size, 1)) if tp.info.row_count else 0
+                how = "chunked, %d rows/batch (~%d batches)" % (tp.batch_size, chunks)
+            else:
+                how = "single transaction, ~%d MB log" % estimate_log_mb(tp.info)
+            lines.append("  %s  [~%d rows, %.1f MB, %s, key=%s]" % (
+                tp.fqn, tp.info.row_count, size_mb, how, ",".join(tp.key_columns) or "-"))
             for cp in tp.columns:
+                extra = []
+                if cp.auto_added:
+                    extra.append("auto-added via FK")
+                if cp.entity_info is not None:
+                    extra.append("per-person shift by %s" % cp.entity_info.name)
+                if cp.output_info is not None:
+                    extra.append("output_type %s" % cp.output_info.type_display())
+                if cp.overrides:
+                    extra.append(", ".join("%s=%s" % kv for kv in cp.overrides.items()))
                 lines.append("      - %-30s %-16s -> domain '%s' (%s)%s" % (
                     cp.name, cp.info.type_display(), cp.domain.name, cp.domain.type,
-                    "  [auto-added via FK]" if cp.auto_added else ""))
+                    ("  [%s]" % "; ".join(extra)) if extra else ""))
+            for ix in tp.disable_indexes:
+                lines.append("      note: unique index %s disabled during update, rebuilt afterwards" % ix.name)
             for n in tp.notes:
                 lines.append("      note: %s" % n)
         if self.foreign_keys:
@@ -136,12 +167,15 @@ class Plan:
         return "\n".join(lines)
 
 
-def build_plan(catalog: SchemaCatalog, rules: Rules, execution: Dict[str, Any], chunking_available: bool) -> Plan:
+def build_plan(catalog: SchemaCatalog, rules: Rules, execution: Dict[str, Any], chunking_available: bool,
+               batching: Optional[Dict[str, Any]] = None) -> Plan:
     errors: List[str] = []
     warnings: List[str] = []
-    targets: Dict[Tuple[str, str], Dict[str, Tuple[str, bool]]] = {}  # (s,t) -> col_lower -> (domain, auto)
+    # (s,t) -> col_lower -> (domain, auto_added, ColumnRule or None)
+    targets: Dict[Tuple[str, str], Dict[str, Tuple[str, bool, Optional[ColumnRule]]]] = {}
     order: List[Tuple[str, str]] = []
     key_override: Dict[Tuple[str, str], List[str]] = {}
+    batching = batching or {}
 
     for tr in rules.tables:
         ti = catalog.get(tr.schema, tr.table)
@@ -156,14 +190,14 @@ def build_plan(catalog: SchemaCatalog, rules: Rules, execution: Dict[str, Any], 
             if ti.column(cr.name) is None:
                 errors.append("Column %s.%s does not exist" % (tr.fqn, cr.name))
                 continue
-            targets[k][cr.name.lower()] = (cr.domain, False)
+            targets[k][cr.name.lower()] = (cr.domain, False, cr)
 
     # ---- referential integrity closure over foreign keys --------------------
     fks: Dict[Tuple[str, str], ForeignKey] = {}
     queue = [(k, c) for k in order for c in list(targets[k])]
     while queue:
         (s, t), c = queue.pop(0)
-        domain, _ = targets[(s, t)][c]
+        domain = targets[(s, t)][c][0]
         for fk, side, os_, ot, oc in catalog.fks_touching(s, t, c):
             fks[(fk.schema.lower(), fk.name.lower())] = fk
             if fk.update_action == 1:
@@ -183,7 +217,7 @@ def build_plan(catalog: SchemaCatalog, rules: Rules, execution: Dict[str, Any], 
                     targets[ok_key] = {}
                     order.append(ok_key)
                     key_override[ok_key] = []
-                targets[ok_key][oc.lower()] = (domain, True)
+                targets[ok_key][oc.lower()] = (domain, True, None)
                 queue.append((ok_key, oc.lower()))
                 warnings.append("Auto-added %s.%s.%s (domain '%s') because FK %s references masked column %s.%s.%s"
                                 % (os_, ot, oc, domain, fk.name, s, t, c))
@@ -195,10 +229,11 @@ def build_plan(catalog: SchemaCatalog, rules: Rules, execution: Dict[str, Any], 
     # ---- per table checks and strategy ------------------------------------
     tables: List[TablePlan] = []
     domain_families: Dict[str, set] = {}
+    mismatch = execution.get("type_mismatch", "error")
     for k in order:
         ti = catalog.get(*k)
         cols: List[ColumnPlan] = []
-        for ordinal, (cname, (dname, auto)) in enumerate(targets[k].items(), start=1):
+        for ordinal, (cname, (dname, auto, rule)) in enumerate(targets[k].items(), start=1):
             ci = ti.column(cname)
             dom = rules.domains.get(dname)
             if dom is None:
@@ -217,8 +252,40 @@ def build_plan(catalog: SchemaCatalog, rules: Rules, execution: Dict[str, Any], 
             if ti.is_unique_column(ci.name) and not is_injective(dom.type, dom.params):
                 errors.append("%s is part of a primary key/unique index but '%s' is not collision-free; use an "
                               "injective type (fpe, account_number, ssn, email, hash, ...)" % (where, dom.type))
+            cp = ColumnPlan(ci, dom, ordinal, auto)
+            if rule is not None:
+                cp.overrides = dict(rule.overrides)
+                cp.expected_input_type = rule.expected_input_type
+                if rule.expected_input_type:
+                    try:
+                        if not same_type(rule.expected_input_type, ci):
+                            msg = ("%s: expected_input_type is %s but the live column is %s"
+                                   % (where, rule.expected_input_type, ci.type_display()))
+                            (errors if mismatch == "error" else warnings).append(msg)
+                    except ValueError as exc:
+                        errors.append("%s: %s" % (where, exc))
+                if rule.output_type:
+                    try:
+                        cp.output_info = parse_type(rule.output_type, ci.name, ci.is_nullable)
+                    except ValueError as exc:
+                        errors.append("%s: %s" % (where, exc))
+                    else:
+                        if cp.output_info.family != ci.family and cls is not get_masker_class("nullify"):
+                            warnings.append("%s: output_type %s is a different type family than the column; values "
+                                            "are validated against both" % (where, rule.output_type))
+                if rule.entity_column:
+                    ei = ti.column(rule.entity_column)
+                    if ei is None:
+                        errors.append("%s: entity_column %s does not exist in %s" % (where, rule.entity_column, ti.fqn))
+                    elif ei.family == "other":
+                        errors.append("%s: entity_column %s has unsupported type %s" % (where, ei.name, ei.data_type))
+                    else:
+                        cp.entity_info = ei
+            elif cls.entity_required(cls.validate_params(dom.params)):
+                errors.append("%s was auto-added with per-person date domain '%s' but has no entity_column; add it "
+                              "to the rules explicitly" % (where, dname))
             domain_families.setdefault(dname, set()).add(ci.family)
-            cols.append(ColumnPlan(ci, dom, ordinal, auto))
+            cols.append(cp)
 
         tp = TablePlan(ti, cols)
         masked = {c.name.lower() for c in cols}
@@ -242,25 +309,38 @@ def build_plan(catalog: SchemaCatalog, rules: Rules, execution: Dict[str, Any], 
             reasons.append("key column is masked")
         elif tp.key_info.family not in ("int", "string"):
             reasons.append("key type %s not supported for chunking" % tp.key_info.data_type)
-        uniq = [c.name for c in cols if ti.is_unique_column(c.name)]
-        if uniq:
-            reasons.append("masked column(s) %s are unique" % ", ".join(uniq))
+        blocking, disable = [], []
+        for c in cols:
+            for ix in ti.unique_indexes_on(c.name):
+                if ix.can_disable and execution.get("disable_unique_indexes", True):
+                    if ix not in disable:
+                        disable.append(ix)
+                else:
+                    blocking.append("%s (%s)" % (c.name, ix.name))
+        if blocking:
+            reasons.append("masked column(s) %s are in a PK/clustered/FK-referenced unique index" % ", ".join(blocking))
         if reasons:
             tp.strategy = "single"
             tp.notes.append("single-statement update: " + "; ".join(reasons))
             limit = execution.get("allow_single_statement_rows", 50000000)
             if ti.row_count > limit:
-                warnings.append("%s has ~%d rows and will be updated in ONE transaction (%s); ensure transaction log "
-                                "space or add key_columns." % (ti.fqn, ti.row_count, "; ".join(reasons)))
+                warnings.append("%s has ~%d rows and will be updated in ONE transaction (~%d MB log) because %s. "
+                                "Make sure the log can hold it, or provide an unmasked key_columns."
+                                % (ti.fqn, ti.row_count, estimate_log_mb(ti), "; ".join(reasons)))
         else:
             tp.strategy = "chunked"
+            tp.disable_indexes = disable
+            bs = execution.get("batch_size", "auto")
+            tp.batch_size = recommend_batch_size(ti, batching) if bs == "auto" else int(bs)
         tables.append(tp)
 
     for dname, fams in domain_families.items():
-        if len(fams) > 1:
+        dom = rules.domains.get(dname)
+        normalized = dom is not None and (dom.params.get("normalize") == "digits" or dom.type == "ssn")
+        if len(fams) > 1 and not normalized:
             warnings.append("Domain '%s' is used on columns of different type families %s; values only stay "
-                            "consistent where their text form is identical (e.g. '00123' vs 123 differ)."
-                            % (dname, sorted(fams)))
+                            "consistent where their text form is identical (e.g. '00123' vs 123 differ). "
+                            "Use params {normalize: digits, pad_to: N} (see 'recommend')." % (dname, sorted(fams)))
     return Plan(tables, list(fks.values()), warnings, errors)
 
 
@@ -282,10 +362,19 @@ def hash_expr(alias: str, col: ColumnInfo) -> str:
     return "HASHBYTES('SHA2_256', %s)" % text_expr(alias, col)
 
 
+def key_expr(alias: str, cp: ColumnPlan) -> str:
+    """Map key: hash of the value, or of (entity, value) for per-person maskers."""
+    if cp.entity_info is None:
+        return hash_expr(alias, cp.info)
+    return "HASHBYTES('SHA2_256', CONCAT(ISNULL(N'1' + %s, N'0'), NCHAR(31), %s))" % (
+        text_expr(alias, cp.entity_info), text_expr(alias, cp.info))
+
+
 def distinct_values_sql(tp: TablePlan, cp: ColumnPlan) -> str:
+    entity = (", MIN(%s) AS e" % text_expr("t", cp.entity_info)) if cp.entity_info is not None else ""
     return (
-        "SELECT %s AS h, MIN(%s) AS v FROM %s AS t WHERE t.%s IS NOT NULL GROUP BY %s"
-        % (hash_expr("t", cp.info), text_expr("t", cp.info), tp.sql_name, quote_ident(cp.name), hash_expr("t", cp.info))
+        "SELECT %s AS h, MIN(%s) AS v%s FROM %s AS t WHERE t.%s IS NOT NULL GROUP BY %s"
+        % (key_expr("t", cp), text_expr("t", cp.info), entity, tp.sql_name, quote_ident(cp.name), key_expr("t", cp))
     )
 
 
@@ -303,7 +392,7 @@ def update_sql(tp: TablePlan, ranged: bool, lower_bound: bool) -> str:
             current = "CAST(t.%s AS NVARCHAR(MAX))" % qc
         sets.append("%s = CASE WHEN %s.h IS NULL THEN %s ELSE %s.masked END" % (qc, a, current, a))
         joins.append("LEFT JOIN #deid_map AS %s ON %s.col_ord = %d AND %s.h = %s"
-                     % (a, a, cp.ordinal, a, hash_expr("t", cp.info)))
+                     % (a, a, cp.ordinal, a, key_expr("t", cp)))
         conds.append("%s.h IS NOT NULL" % a)
     where = "(" + " OR ".join(conds) + ")"
     if ranged:
@@ -337,12 +426,12 @@ def check_fits(col: ColumnInfo, masked: Optional[str]) -> Optional[str]:
     if fam == "string":
         mc = col.max_chars
         if mc and mc > 0 and len(masked) > mc:
-            return "masked value length %d exceeds column length %d" % (len(masked), mc)
+            return "masked value length %d exceeds %s" % (len(masked), col.type_display())
     elif fam == "int":
         try:
             n = int(masked)
         except ValueError:
-            return "masked value is not an integer"
+            return "masked value is not an integer (%s)" % col.type_display()
         lo, hi = INT_RANGES[col.data_type.lower()]
         if not lo <= n <= hi:
             return "masked value is out of %s range" % col.data_type
@@ -350,7 +439,7 @@ def check_fits(col: ColumnInfo, masked: Optional[str]) -> Optional[str]:
         try:
             d = decimal.Decimal(masked)
         except decimal.InvalidOperation:
-            return "masked value is not numeric"
+            return "masked value is not numeric (%s)" % col.type_display()
         if col.data_type.lower() in ("decimal", "numeric"):
             int_digits = len(str(abs(int(d)))) if int(d) != 0 else 0
             if int_digits > col.precision - col.scale:
@@ -375,6 +464,7 @@ class ColumnStats:
     non_null_before: int = 0
     distinct_after: Optional[int] = None
     collisions: int = 0
+    truncated: int = 0
     errors: List[str] = field(default_factory=list)
 
 
@@ -385,13 +475,22 @@ class Engine:
         self.keyring = keyring
         self.factory = conn_factory
         self.ex = settings.execution
-        self.maskers: Dict[str, BaseMasker] = {
-            d.name: create_masker(d.type, d.name, keyring, d.params) for d in rules.domains.values()
-        }
+        pinned = (settings.security.get("expected_key_fingerprint") or "").strip()
+        if pinned and pinned != keyring.fingerprint():
+            raise PlanError(
+                "DEID_SECRET_KEY does not match security.expected_key_fingerprint (%s, got %s). Every server must use "
+                "the same key or masked values will differ between databases." % (pinned, keyring.fingerprint()))
+        self.maskers: Dict[str, BaseMasker] = build_maskers(rules.domains.values(), keyring)
+        self._col_maskers: Dict[Tuple[str, str], BaseMasker] = {}
         self._collisions: Dict[str, Dict[str, bytes]] = {}
+        self._collision_capped: set = set()
+        self.workers = resolve_workers(self.ex.get("workers", "auto"))
+        self.pool = MaskingPool(self.workers, rules.domains.values(), keyring)
         self.read = None
         self.work = None
         self.audit_conn = None
+        self._state: Dict[str, Any] = {}
+        self._data_changed = False  # any masked data committed in this run (=> never report FAILED)
 
     # ------------------------------------------------------------------ connections
     def connect(self) -> Dict[str, Any]:
@@ -405,6 +504,7 @@ class Engine:
         return info
 
     def close(self) -> None:
+        self.pool.close()
         for c in (self.read, self.work, self.audit_conn):
             try:
                 if c is not None:
@@ -414,7 +514,8 @@ class Engine:
 
     def plan(self) -> Plan:
         catalog = SchemaCatalog.load(self.read)
-        return build_plan(catalog, self.rules, self.ex, bool(self.settings.audit.get("write_to_db", True)))
+        return build_plan(catalog, self.rules, self.ex, bool(self.settings.audit.get("write_to_db", True)),
+                          self.settings.batching)
 
     def previous_runs(self) -> List[Dict[str, Any]]:
         if not self.settings.audit.get("write_to_db", True):
@@ -430,6 +531,14 @@ class Engine:
         finally:
             conn.close()
 
+    def _col_masker(self, tp: TablePlan, cp: ColumnPlan) -> BaseMasker:
+        key = (tp.fqn, cp.name)
+        m = self._col_maskers.get(key)
+        if m is None:
+            m = column_masker(self.maskers[cp.domain.name], self.keyring, cp.overrides)
+            self._col_maskers[key] = m
+        return m
+
     # ------------------------------------------------------------------ run
     def execute(self, plan: Plan, dry_run: bool, info: Dict[str, Any], resume_from: Optional[str] = None) -> Dict[str, Any]:
         if not plan.ok:
@@ -441,7 +550,8 @@ class Engine:
         audit = AuditTrail(self.settings.audit, run_id, self.audit_conn if db_audit else None)
         audit.ensure_schema()
         mode = "dry-run" if dry_run else "run"
-        state: Dict[str, Any] = {"run_id": run_id, "fks_disabled": [], "triggers_disabled": {}}
+        state: Dict[str, Any] = {"run_id": run_id, "fks_disabled": [], "indexes_disabled": []}
+        self._state = state
 
         if resume_from:
             prev = AuditTrail.load_state(self.settings.audit["output_dir"], resume_from)
@@ -451,12 +561,14 @@ class Engine:
             if prev_summary.get("key_fingerprint") != self.keyring.fingerprint():
                 raise PlanError("Secret key differs from run %s; resume needs the same DEID_SECRET_KEY" % resume_from)
             state["fks_disabled"] = list(prev.get("fks_disabled", []))
+            state["indexes_disabled"] = list(prev.get("indexes_disabled", []))
             state["resumed_from"] = resume_from
 
         audit.start_run(mode, dict(
             info, tool_version=__version__, rules_file=str(self.rules.source_path or ""),
             rules_hash=self.rules.content_hash, key_fingerprint=self.keyring.fingerprint(),
-            resumed_from=resume_from, tables_planned=len(plan.tables),
+            algorithm_version=ALGORITHM_VERSION, resumed_from=resume_from, tables_planned=len(plan.tables),
+            workers=self.workers,
         ))
         for w in plan.warnings:
             audit.event("WARN", w)
@@ -508,7 +620,8 @@ class Engine:
         elif not failures:
             status = "SUCCEEDED"
         else:
-            status = "PARTIAL" if completed else "FAILED"
+            # FAILED only when nothing was committed; otherwise the re-run guard must treat the data as touched.
+            status = "PARTIAL" if (completed or self._data_changed) else "FAILED"
         message = "; ".join(failures)
         audit.end_run(status, message, completed, total_rows)
         return {"run_id": run_id, "status": status, "tables_completed": completed, "tables": len(plan.tables),
@@ -553,11 +666,37 @@ class Engine:
         state["fks_disabled"] = remaining
         return problems
 
+    def _disable_unique_indexes(self, tp: TablePlan, audit: AuditTrail) -> None:
+        mine = {(i["schema"], i["table"], i["name"]) for i in self._state["indexes_disabled"]}
+        for ix in tp.disable_indexes:
+            ident = (tp.info.schema, tp.info.name, ix.name)
+            if index_disabled(self.work, *ident):
+                continue  # disabled by the run being resumed (rebuilt below) or by the user (left alone)
+            self.work.cursor().execute("ALTER INDEX %s ON %s DISABLE" % (quote_ident(ix.name), tp.sql_name))
+            self.work.commit()
+            if ident not in mine:
+                self._state["indexes_disabled"].append({"schema": ident[0], "table": ident[1], "name": ident[2]})
+            audit.save_state(self._state)
+            audit.event("INFO", "Disabled unique index %s for batched update" % ix.name, tp.fqn)
+
+    def _rebuild_unique_indexes(self, tp: TablePlan, audit: AuditTrail) -> None:
+        for rec in list(self._state["indexes_disabled"]):
+            if (rec["schema"].lower(), rec["table"].lower()) != (tp.info.schema.lower(), tp.info.name.lower()):
+                continue
+            log.info("Rebuilding unique index %s on %s", rec["name"], tp.fqn)
+            self.work.cursor().execute("ALTER INDEX %s ON %s REBUILD" % (quote_ident(rec["name"]), tp.sql_name))
+            self.work.commit()
+            self._state["indexes_disabled"].remove(rec)
+            audit.save_state(self._state)
+            audit.event("INFO", "Rebuilt and re-validated unique index %s" % rec["name"], tp.fqn)
+
     # ------------------------------------------------------------------ table
     def _process_table(self, tp: TablePlan, run_id: str, dry_run: bool, audit: AuditTrail, prog: Dict[str, Any]) -> int:
         started = _utc()
         t0 = time.time()
-        log.info("%s %s (%d columns, strategy=%s)", "Scanning" if dry_run else "Masking", tp.fqn, len(tp.columns), tp.strategy)
+        log.info("%s %s (%d columns, ~%d rows, strategy=%s%s)", "Scanning" if dry_run else "Masking", tp.fqn,
+                 len(tp.columns), tp.info.row_count, tp.strategy,
+                 ", batch=%d" % tp.batch_size if tp.strategy == "chunked" else "")
         counts = self._counts(tp)
         stats = self._build_map(tp, write=not dry_run)
         for cp in tp.columns:
@@ -583,6 +722,7 @@ class Engine:
             if triggers:
                 audit.event("INFO", "Disabled triggers: %s" % ", ".join(triggers), tp.fqn)
             if tp.strategy == "chunked":
+                self._disable_unique_indexes(tp, audit)
                 rows = self._update_chunked(tp, run_id, audit, prog)
             else:
                 rows = self._update_single(tp, run_id, audit)
@@ -624,9 +764,18 @@ class Engine:
                     % (tp.sql_name, quote_ident(cp.name), hash_expr("t", cp.info)))
         return int(cur.fetchone()[0])
 
+    def _fetch_batches(self, cur, size: int):
+        while True:
+            rows = cur.fetchmany(size)
+            if not rows:
+                return
+            yield [tuple(r) for r in rows]
+
     def _build_map(self, tp: TablePlan, write: bool) -> Dict[int, ColumnStats]:
         stats = {cp.ordinal: ColumnStats() for cp in tp.columns}
-        fetch = int(self.ex.get("fetch_size", 5000))
+        fetch = int(self.ex.get("fetch_size", 20000))
+        cap = int(self.ex.get("collision_check_max_values", 5000000))
+        parallel = self.workers > 1 and tp.info.row_count >= PARALLEL_MIN_ROWS
         ins = None
         if write:
             self.work.cursor().execute(MAP_DDL)
@@ -635,41 +784,48 @@ class Engine:
         for cp in tp.columns:
             if cp.is_nullify:
                 continue
-            masker = self.maskers[cp.domain.name]
+            masker = self._col_masker(tp, cp)
             st = stats[cp.ordinal]
-            check = self.ex.get("collision_check", True) and masker.collision_check
+            check = bool(self.ex.get("collision_check", True) and masker.collision_check)
             seen = self._collisions.setdefault(cp.domain.name, {}) if check else None
+            truncate = cp.domain.type == "free_text" and masker.params.get("on_overflow") == "truncate"
+            targets = [cp.info] + ([cp.output_info] if cp.output_info is not None else [])
             rcur = self.read.cursor()
             rcur.execute(distinct_values_sql(tp, cp))
-            while True:
-                rows = rcur.fetchmany(fetch)
-                if not rows:
-                    break
+            for _, results in self.pool.map(masker, cp.overrides, self._fetch_batches(rcur, fetch), check, parallel):
                 batch = []
-                for h, value in rows:
+                for h, masked, err, digest in results:
                     st.distinct_before += 1
-                    try:
-                        masked = masker.mask(value)
-                    except MaskerError as exc:
-                        if len(st.errors) < MAX_REPORTED_ERRORS:
-                            st.errors.append(str(exc))
-                        continue
-                    err = check_fits(cp.info, masked)
+                    if err is None and truncate and masked is not None:
+                        limit = min([c.max_chars for c in targets if c.max_chars and c.max_chars > 0] or [0])
+                        if limit and len(masked) > limit:
+                            masked = masked[:limit]
+                            st.truncated += 1
+                    if err is None:
+                        err = next((e for e in (check_fits(c, masked) for c in targets) if e), None)
                     if err:
                         if len(st.errors) < MAX_REPORTED_ERRORS:
                             st.errors.append(err)
                         continue
-                    if seen is not None and masked is not None:
-                        src = hashlib.sha256(masker.canonical(value).encode("utf-8")).digest()[:16]
-                        prior = seen.setdefault(masked, src)
-                        if prior != src:
+                    if seen is not None and masked is not None and cp.domain.name not in self._collision_capped:
+                        prior = seen.get(masked)
+                        if prior is None:
+                            if len(seen) >= cap:
+                                self._collision_capped.add(cp.domain.name)
+                                log.warning("Collision check for domain '%s' covered the first %d values (cap "
+                                            "execution.collision_check_max_values)", cp.domain.name, cap)
+                            else:
+                                seen[masked] = digest
+                        elif prior != digest:
                             st.collisions += 1
                             if len(st.errors) < MAX_REPORTED_ERRORS:
                                 st.errors.append("collision: two different values mask to the same output in domain "
                                                  "'%s' (increase token_length)" % cp.domain.name)
-                    batch.append((cp.ordinal, bytes(h), masked))
+                    batch.append((cp.ordinal, h, masked))
                 if write and batch and not st.errors:
                     self._insert_map(ins, batch)
+            if st.truncated:
+                log.info("%s.%s: %d free-text value(s) truncated to fit the column", tp.fqn, cp.name, st.truncated)
             log.debug("%s.%s: %d distinct values mapped", tp.fqn, cp.name, st.distinct_before)
         if write:
             self.work.commit()
@@ -707,18 +863,20 @@ class Engine:
                 cur.execute(audit.progress_upsert_sql(),
                             audit.progress_params(run_id, tp.info.schema, tp.info.name, "COMPLETED", None, n))
             self.work.commit()
+            self._data_changed = True
             return n
 
         return self._retry(work, "update of %s" % tp.fqn)
 
     def _update_chunked(self, tp: TablePlan, run_id: str, audit: AuditTrail, prog: Dict[str, Any]) -> int:
-        batch = int(self.ex.get("batch_size", 50000))
+        batch = tp.batch_size
         key_is_int = tp.key_info.family == "int"
         last = prog.get("last_key")
         if last is not None:
             last = int(last) if key_is_int else last
             log.info("Resuming %s after key %s", tp.fqn, last)
         total = 0
+        t0 = time.time()
         while True:
             def chunk(lower=last):
                 cur = self.work.cursor()
@@ -737,6 +895,7 @@ class Engine:
                 cur.execute(audit.progress_upsert_sql(),
                             audit.progress_params(run_id, tp.info.schema, tp.info.name, "IN_PROGRESS", upper, n))
                 self.work.commit()
+                self._data_changed = True
                 return upper, n
 
             upper, n = self._retry(chunk, "chunk of %s" % tp.fqn)
@@ -744,7 +903,9 @@ class Engine:
                 break
             last = upper
             total += n
-            log.info("  %s: %d rows updated so far (key <= %s)", tp.fqn, total, last)
+            rate = total / max(time.time() - t0, 0.001)
+            log.info("  %s: %d rows updated so far (key <= %s, %.0f rows/s)", tp.fqn, total, last, rate)
+        self._rebuild_unique_indexes(tp, audit)
         cur = self.work.cursor()
         cur.execute(audit.progress_upsert_sql(),
                     audit.progress_params(run_id, tp.info.schema, tp.info.name, "COMPLETED", last, 0))
@@ -754,19 +915,22 @@ class Engine:
     def _record(self, audit, tp, stats, counts, status, rows, started, message) -> None:
         for cp in tp.columns:
             st = stats[cp.ordinal]
+            note = message or ("; ".join(st.errors) if st.errors else "")
+            if st.truncated:
+                note = (note + "; " if note else "") + "%d value(s) truncated" % st.truncated
             audit.column_result({
                 "schema_name": tp.info.schema, "table_name": tp.info.name, "column_name": cp.name,
-                "domain": cp.domain.name, "mask_type": cp.domain.type, "strategy": tp.strategy, "status": status,
+                "domain": cp.domain.name, "mask_type": cp.domain.type, "strategy": tp.strategy,
+                "batch_size": tp.batch_size if tp.strategy == "chunked" else None, "status": status,
                 "rows_total": counts.get(0), "rows_non_null_before": counts.get(cp.ordinal),
                 "distinct_before": st.distinct_before if not cp.is_nullify else None,
                 "rows_updated": rows, "distinct_after": st.distinct_after, "collisions": st.collisions,
-                "message": message or ("; ".join(st.errors) if st.errors else ""),
-                "started_at": started, "ended_at": _utc(),
+                "message": note, "started_at": started, "ended_at": _utc(),
             })
 
 
 def _utc():
-    return _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None).replace(microsecond=0)
+    return _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None, microsecond=0)
 
 
 def _load_summary(output_dir: str, run_id: str) -> Dict[str, Any]:

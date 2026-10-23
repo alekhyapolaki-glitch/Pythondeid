@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -66,6 +67,56 @@ class ColumnInfo:
         return t
 
 
+_TYPE_RE = re.compile(r"^\s*([a-z0-9_]+)\s*(?:\(\s*(max|\d+)\s*(?:,\s*(\d+)\s*)?\))?\s*$", re.I)
+
+
+def parse_type(text: str, name: str = "output", nullable: bool = True) -> ColumnInfo:
+    """'varchar(11)' / 'nvarchar(max)' / 'decimal(12,2)' / 'int' -> ColumnInfo (max_length in bytes, like sys.columns)."""
+    m = _TYPE_RE.match(text or "")
+    if not m:
+        raise ValueError("Cannot parse SQL type '%s' (examples: varchar(11), nvarchar(max), decimal(12,2), int)" % text)
+    base, size, scale = m.group(1).lower(), m.group(2), m.group(3)
+    known = STRING_TYPES | INT_TYPES | DECIMAL_TYPES | DATE_TYPES | {"float", "real", "uniqueidentifier", "bit"}
+    if base not in known:
+        raise ValueError("Unknown SQL type '%s'" % base)
+    max_length, precision, sc = 0, 0, 0
+    if base in ("char", "varchar", "nchar", "nvarchar"):
+        n = -1 if (size or "").lower() == "max" else int(size or 1)
+        max_length = n * 2 if base in ("nchar", "nvarchar") and n != -1 else n
+    elif base in ("text", "ntext"):
+        max_length = -1
+    elif base in ("decimal", "numeric"):
+        precision, sc = int(size or 18), int(scale or 0)
+    return ColumnInfo("", "", name, base, max_length, precision, sc, nullable)
+
+
+def same_type(expected: str, actual: ColumnInfo) -> bool:
+    exp = parse_type(expected)
+    if exp.data_type != actual.data_type.lower():
+        return False
+    if exp.family == "string":
+        return exp.max_chars == actual.max_chars
+    if exp.data_type in ("decimal", "numeric"):
+        return (exp.precision, exp.scale) == (actual.precision, actual.scale)
+    return True
+
+
+@dataclass
+class IndexInfo:
+    name: str
+    columns: List[str]
+    is_primary_key: bool = False
+    is_unique_constraint: bool = False
+    is_clustered: bool = False
+    is_disabled: bool = False
+    referenced_by_fk: bool = False
+
+    @property
+    def can_disable(self) -> bool:
+        """Nonclustered, not a PK and not the target of a foreign key -> safe to disable and rebuild."""
+        return not (self.is_primary_key or self.is_clustered or self.referenced_by_fk)
+
+
 @dataclass
 class TableInfo:
     schema: str
@@ -74,6 +125,16 @@ class TableInfo:
     primary_key: List[str] = field(default_factory=list)
     unique_sets: List[List[str]] = field(default_factory=list)
     row_count: int = 0
+    unique_indexes: List[IndexInfo] = field(default_factory=list)
+    data_bytes: int = 0      # used pages of heap/clustered index (incl. LOB) * 8 KB
+
+    @property
+    def avg_row_bytes(self) -> int:
+        return max(1, self.data_bytes // self.row_count) if self.row_count and self.data_bytes else 200
+
+    def unique_indexes_on(self, column: str) -> List[IndexInfo]:
+        c = column.lower()
+        return [i for i in self.unique_indexes if c in [x.lower() for x in i.columns]]
 
     @property
     def fqn(self) -> str:
@@ -170,7 +231,9 @@ class SchemaCatalog:
 
         cur.execute(
             """
-            SELECT s.name, t.name, i.name, i.is_primary_key, c.name
+            SELECT s.name, t.name, i.name, i.is_primary_key, c.name, i.is_unique_constraint, i.type, i.is_disabled,
+                   CASE WHEN EXISTS (SELECT 1 FROM sys.foreign_keys fk WHERE fk.referenced_object_id = i.object_id
+                                     AND fk.key_index_id = i.index_id) THEN 1 ELSE 0 END
             FROM sys.indexes i
             JOIN sys.tables t ON t.object_id = i.object_id
             JOIN sys.schemas s ON s.schema_id = t.schema_id
@@ -180,31 +243,40 @@ class SchemaCatalog:
             ORDER BY s.name, t.name, i.index_id, ic.key_ordinal""",
             params,
         )
-        sets: Dict[Tuple[str, str, str], Tuple[bool, List[str]]] = {}
-        for schema, table, index, is_pk, col in cur.fetchall():
-            sets.setdefault((schema, table, index), (bool(is_pk), []))[1].append(col)
-        for (schema, table, _), (is_pk, cols) in sets.items():
+        sets: Dict[Tuple[str, str, str], IndexInfo] = {}
+        for schema, table, index, is_pk, col, is_uc, itype, is_dis, ref in cur.fetchall():
+            ix = sets.get((schema, table, index))
+            if ix is None:
+                ix = IndexInfo(index, [], bool(is_pk), bool(is_uc), int(itype) == 1, bool(is_dis), bool(ref))
+                sets[(schema, table, index)] = ix
+            ix.columns.append(col)
+        for (schema, table, _), ix in sets.items():
             t = cat.get(schema, table)
             if t is None:
                 continue
-            t.unique_sets.append(cols)
-            if is_pk:
-                t.primary_key = list(cols)
+            t.unique_sets.append(list(ix.columns))
+            t.unique_indexes.append(ix)
+            if ix.is_primary_key:
+                t.primary_key = list(ix.columns)
 
         cur.execute(
             """
-            SELECT s.name, t.name, SUM(p.rows)
+            SELECT s.name, t.name, SUM(p.rows),
+                   (SELECT SUM(a.used_pages) FROM sys.partitions p2
+                    JOIN sys.allocation_units a ON a.container_id = p2.partition_id
+                    WHERE p2.object_id = t.object_id AND p2.index_id IN (0, 1))
             FROM sys.tables t
             JOIN sys.schemas s ON s.schema_id = t.schema_id
             JOIN sys.partitions p ON p.object_id = t.object_id AND p.index_id IN (0, 1)
             WHERE 1 = 1""" + schema_filter + """
-            GROUP BY s.name, t.name""",
+            GROUP BY s.name, t.name, t.object_id""",
             params,
         )
-        for schema, table, rows in cur.fetchall():
+        for schema, table, rows, pages in cur.fetchall():
             t = cat.get(schema, table)
             if t is not None:
                 t.row_count = int(rows or 0)
+                t.data_bytes = int(pages or 0) * 8192
 
         # Foreign keys are always loaded database-wide: a referencing table may live in another schema.
         cur.execute(
@@ -255,3 +327,14 @@ def fk_status(conn, schema: str, name: str) -> Tuple[bool, bool]:
     )
     row = cur.fetchone()
     return (bool(row[0]), bool(row[1])) if row else (False, False)
+
+
+def index_disabled(conn, schema: str, table: str, index: str) -> bool:
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT i.is_disabled FROM sys.indexes i JOIN sys.tables t ON t.object_id = i.object_id "
+        "JOIN sys.schemas s ON s.schema_id = t.schema_id WHERE s.name = ? AND t.name = ? AND i.name = ?",
+        [schema, table, index],
+    )
+    row = cur.fetchone()
+    return bool(row[0]) if row else False

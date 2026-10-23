@@ -1,28 +1,36 @@
 """Deterministic masking algorithms.
 
-Referential integrity rule
---------------------------
-Every masker is a pure function of (secret key, *domain*, normalised value).
-A *domain* is a named masking definition (e.g. ``email``, ``customer_ssn``)
-that can be attached to any number of columns in any number of tables.  The
-same input value in the same domain therefore always yields the same masked
-value - in every table, every batch, every run and every database masked with
-the same key - so joins and foreign keys keep working.
+Consistency guarantee (tables, databases, servers)
+--------------------------------------------------
+Every masker is a pure function of
 
-Keys are derived per domain:  domain_key = HMAC-SHA256(master_key, domain).
-Changing the master key changes every masked value; keep it stable and secret.
+    (master secret, ALGORITHM_VERSION, domain name, domain params, canonical input)
+
+and nothing else - no randomness, no run id, no server name, no row order.
+Two servers that use the same secret key and the same rules file therefore
+produce byte-identical masked values for the same input, in every table,
+database, batch and run.  ``security.expected_key_fingerprint`` and
+``python main.py test-vectors`` let you prove that every environment is
+configured identically.
+
+*Canonical input* removes representation differences before masking:
+``John.Doe@Mail.COM`` = ``john.doe@mail.com``, ``123-45-6789`` = ``123456789``,
+and with ``normalize: digits`` an account number stored as ``'0000012345'``
+(varchar) and ``12345`` (bigint) masks to the same number.
+
+Keys are derived per domain:  domain_key = HMAC-SHA256(master, "v1|" + domain).
 
 Masker families
 ---------------
 * bijective (collision-free) format-preserving: ``fpe``, ``account_number``,
-  ``ssn``, ``phone``, ``credit_card``, ``zip`` (mode=fpe) - safe for keys
-  and unique columns.
-* keyed tokens: ``email``, ``hash`` - collision probability is negligible and
-  checked at run time.
+  ``ssn``, ``phone``, ``credit_card``, ``zip`` (mode=fpe) - safe for keys.
+* keyed tokens: ``email``, ``hash`` - collision-checked at run time.
 * dictionary substitution: ``first_name``, ``last_name``, ``full_name``,
-  ``street_address``, ``city`` - realistic but NOT unique.
-* generalisation / suppression: ``zip`` (mode=truncate), ``date_shift``,
-  ``redact``, ``nullify``.
+  ``street_address``, ``city`` - realistic, NOT unique.
+* generalisation / suppression: ``zip`` (truncate), ``date_shift`` (per value
+  or per person), ``redact``, ``nullify``.
+* ``free_text``: scrub PII patterns inside notes/comments (optionally masking
+  each hit with another domain, so a SSN in a note matches the SSN column).
 """
 
 from __future__ import annotations
@@ -34,10 +42,13 @@ import hashlib
 import hmac
 import os
 import re
-from typing import Any, Dict, Optional, Type
+from typing import Any, Dict, FrozenSet, List, Optional, Tuple, Type
 
 from . import data
 from .fpe import FeistelCipher, encrypt_text
+
+#: Bump only if an algorithm changes output. Rules may pin it (algorithm_version: 1).
+ALGORITHM_VERSION = 1
 
 
 class MaskerError(ValueError):
@@ -70,7 +81,7 @@ class KeyRing:
         if not secret:
             raise MaskerError(
                 "Environment variable %s is not set. Generate a key with 'python main.py genkey' and set it "
-                "before running (the same key must be used for every run to keep masking consistent)." % env_var
+                "before running (the same key must be used on every server to keep masking consistent)." % env_var
             )
         return cls.from_string(secret, min_length)
 
@@ -82,7 +93,7 @@ class KeyRing:
         return hmac.new(self._master, b"pythondeid-domain-v1|" + domain.encode("utf-8"), hashlib.sha256).digest()
 
     def fingerprint(self) -> str:
-        """Non-reversible identifier of the key, safe to store in audit records."""
+        """Non-reversible identifier of the key, safe to store in audit records and config."""
         return hmac.new(self._master, b"pythondeid-fingerprint", hashlib.sha256).hexdigest()[:16]
 
 
@@ -93,12 +104,16 @@ class BaseMasker:
     type_name = ""
     description = ""
     default_params: Dict[str, Any] = {}
+    #: params that only change how the result is rendered; columns may override them
+    format_params: FrozenSet[str] = frozenset()
     #: column type families this masker may be applied to
-    families = ("string",)
+    families: Tuple[str, ...] = ("string",)
     #: True if two different inputs can never produce the same output
     injective = False
     #: True if the engine should actively check for output collisions
     collision_check = False
+    #: True if the masker uses a second "entity" value (e.g. person id for date shifting)
+    uses_entity = False
 
     def __init__(self, domain: str, key: bytes, params: Optional[Dict[str, Any]] = None):
         self.domain = domain
@@ -124,6 +139,14 @@ class BaseMasker:
     def _check_params(cls, p: Dict[str, Any]) -> None:
         pass
 
+    @classmethod
+    def entity_required(cls, params: Dict[str, Any]) -> bool:
+        return False
+
+    @classmethod
+    def referenced_domains(cls, params: Dict[str, Any]) -> List[str]:
+        return []
+
     def _setup(self) -> None:
         pass
 
@@ -142,7 +165,7 @@ class BaseMasker:
         """The normalised form the mask is derived from (used for collision checks)."""
         return value
 
-    def mask(self, value: Optional[str]) -> Optional[str]:
+    def mask(self, value: Optional[str], entity: Optional[str] = None) -> Optional[str]:
         if value is None:
             return None
         if value.strip() == "":
@@ -159,6 +182,11 @@ def _non_negative_int(p: Dict[str, Any], *names: str) -> None:
             raise MaskerError("Parameter '%s' must be a non-negative integer" % n)
 
 
+def _choice(p: Dict[str, Any], name: str, allowed) -> None:
+    if p[name] not in allowed:
+        raise MaskerError("Parameter '%s' must be one of %s (got %r)" % (name, ", ".join(map(str, allowed)), p[name]))
+
+
 def _match_case(template: str, value: str) -> str:
     if template.isupper():
         return value.upper()
@@ -172,58 +200,123 @@ def _reinsert_digits(template: str, digits: str) -> str:
     return "".join(next(it) if ch.isdigit() else ch for ch in template)
 
 
+# Partial de-identification options shared by ssn / account_number / credit_card.
+#   full          - every digit/letter is de-identified (default, recommended)
+#   last4         - keep the last 4 digits, de-identify the rest
+#   first6_last4  - (cards) keep BIN + last 4, PCI-DSS display style
+MODES = ("full", "last4", "first6_last4")
+
+
+def _apply_mode(p: Dict[str, Any], allowed=("full", "last4")) -> None:
+    _choice(p, "mode", allowed)
+    _non_negative_int(p, *(n for n in ("preserve_first", "preserve_last") if n in p))
+    if p["mode"] == "full":
+        return
+    want_first, want_last = (6, 4) if p["mode"] == "first6_last4" else (0, 4)
+    for name, want in (("preserve_first", want_first), ("preserve_last", want_last)):
+        if name not in p:
+            continue
+        if p[name] not in (0, want):
+            raise MaskerError("mode=%s conflicts with %s=%s; set only one of them" % (p["mode"], name, p[name]))
+        p[name] = want
+
+
 # =============================================================================
 # Format-preserving / bijective maskers
 # =============================================================================
 class FpeMasker(BaseMasker):
     type_name = "fpe"
     description = "Format-preserving encryption of letters/digits (bijective, keeps separators and length)"
-    default_params = {"preserve_first": 0, "preserve_last": 0, "digits": True, "letters": True}
+    default_params = {
+        "preserve_first": 0, "preserve_last": 0, "digits": True, "letters": True,
+        "normalize": "none", "pad_to": 0,
+    }
     families = ("string", "int", "decimal")
     injective = True
 
     @classmethod
     def _check_params(cls, p):
-        _non_negative_int(p, "preserve_first", "preserve_last")
+        _non_negative_int(p, "preserve_first", "preserve_last", "pad_to")
         if not (p["digits"] or p["letters"]):
             raise MaskerError("At least one of 'digits' or 'letters' must be true")
+        _choice(p, "normalize", ("none", "digits"))
+        if p["normalize"] == "digits":
+            if not 1 <= p["pad_to"] <= 38:
+                raise MaskerError(
+                    "normalize=digits needs pad_to = the maximum number of digits the identifier can have "
+                    "(1-38), e.g. pad_to: 12. This makes '000012345' (varchar) and 12345 (bigint) mask the same.")
+            if p["preserve_first"] + p["preserve_last"] >= p["pad_to"]:
+                raise MaskerError("preserve_first + preserve_last must be smaller than pad_to")
 
     def _setup(self):
         self._cipher = FeistelCipher(self._key)
 
+    def canonical(self, value):
+        if self.params["normalize"] == "digits":
+            digits = re.sub(r"\D", "", value)
+            return (digits.lstrip("0") or "0").zfill(self.params["pad_to"]) if digits else value
+        return value
+
     def _mask(self, value):
-        return encrypt_text(
-            self._cipher, value, self.type_name.encode(),
-            self.params["preserve_first"], self.params["preserve_last"],
-            self.params["digits"], self.params["letters"],
-        )
+        p = self.params
+        if p["normalize"] == "digits" and re.search(r"\d", value):
+            return self._mask_numeric(value)
+        return encrypt_text(self._cipher, value, self.type_name.encode(),
+                            p["preserve_first"], p["preserve_last"], p["digits"], p["letters"])
+
+    def _mask_numeric(self, value):
+        """Type-independent: the digit sequence is treated as a number of fixed width pad_to."""
+        p = self.params
+        canon = self.canonical(value)
+        if len(canon) > p["pad_to"]:
+            raise MaskerError("value has %d significant digits but pad_to is %d; raise pad_to" % (
+                len(canon.lstrip("0")), p["pad_to"]))
+        out = encrypt_text(self._cipher, canon, self.type_name.encode() + b"|num",
+                           p["preserve_first"], p["preserve_last"], True, False)
+        significant = out.lstrip("0") or "0"
+        template_digits = sum(ch.isdigit() for ch in value)
+        if p["letters"]:
+            value = encrypt_text(self._cipher, value, self.type_name.encode() + b"|alpha", digits=False, letters=True)
+        if len(significant) <= template_digits:
+            return _reinsert_digits(value, significant.zfill(template_digits))
+        return out  # number does not fit the original layout; the engine validates the column length
 
 
 class AccountNumberMasker(FpeMasker):
     type_name = "account_number"
-    description = "Account/IBAN/member numbers: FPE keeping length, format and optional leading/trailing chars"
+    description = ("Account/member/policy numbers: FPE keeping format; mode=full (default) or last4; "
+                   "normalize=digits for varchar/int consistency")
+    default_params = dict(FpeMasker.default_params, mode="full")
+
+    @classmethod
+    def _check_params(cls, p):
+        _apply_mode(p)
+        super()._check_params(p)
 
 
 class PhoneMasker(FpeMasker):
     type_name = "phone"
     description = "Phone numbers: FPE on digits only, punctuation/format preserved"
-    default_params = {"preserve_first": 0, "preserve_last": 0, "digits": True, "letters": False}
+    default_params = dict(FpeMasker.default_params, letters=False)
 
 
 class SsnMasker(BaseMasker):
     type_name = "ssn"
-    description = "US SSN: bijective FPE on the 9 digits; realistic=true keeps output inside valid SSA ranges"
-    default_params = {"output_format": "preserve", "realistic": True, "zero_pad": True}
+    description = ("US SSN/TIN: bijective FPE on the 9 digits; mode=full (default) or last4; "
+                   "realistic=true keeps output inside valid SSA ranges")
+    default_params = {"mode": "full", "output_format": "preserve", "realistic": True, "zero_pad": True}
+    format_params = frozenset({"output_format"})
     families = ("string", "int", "decimal")
     injective = True
 
     @classmethod
     def _check_params(cls, p):
-        if p["output_format"] not in ("preserve", "dashed", "digits"):
-            raise MaskerError("ssn.output_format must be one of preserve, dashed, digits")
+        _apply_mode(p)
+        _choice(p, "output_format", ("preserve", "dashed", "digits"))
 
     def _setup(self):
         self._cipher = FeistelCipher(self._key)
+        self._keep = 4 if self.params["mode"] == "last4" else 0
 
     @staticmethod
     def _valid(d: str) -> bool:
@@ -236,21 +329,27 @@ class SsnMasker(BaseMasker):
             digits = digits.zfill(9)
         return digits if len(digits) == 9 else value
 
+    def _encrypt(self, digits: str) -> str:
+        if not self._keep:
+            return self._cipher.encrypt_digits(digits, b"ssn")
+        kept = digits[-self._keep:]
+        return self._cipher.encrypt_digits(digits[:-self._keep], b"ssn|last|" + kept.encode()) + kept
+
     def _mask(self, value):
         stripped = value.strip()
         digits = self.canonical(value)
         if len(digits) != 9 or not digits.isdigit():
-            # Not an SSN shape - still mask it reversibly-safe instead of leaking it.
-            return encrypt_text(self._cipher, value, b"ssn-nonstandard")
+            # Not an SSN shape - still mask it instead of leaking it.
+            return encrypt_text(self._cipher, value, b"ssn-nonstandard", 0, self._keep)
         valid = self._valid(digits)
-        out = self._cipher.encrypt_digits(digits, b"ssn")
+        out = self._encrypt(digits)
         if self.params["realistic"]:
-            # Cycle-walking keeps the map a bijection within valid and invalid sets.
+            # Cycle-walking keeps the map a bijection within the valid and the invalid set.
             guard = 0
             while self._valid(out) != valid:
-                out = self._cipher.encrypt_digits(out, b"ssn")
+                out = self._encrypt(out)
                 guard += 1
-                if guard > 10000:  # pragma: no cover - statistically impossible
+                if guard > 100000:  # pragma: no cover - statistically impossible
                     raise MaskerError("SSN cycle-walk did not terminate")
         fmt = self.params["output_format"]
         if fmt == "digits":
@@ -264,15 +363,19 @@ class SsnMasker(BaseMasker):
 
 class CreditCardMasker(BaseMasker):
     type_name = "credit_card"
-    description = "Card numbers (PAN): FPE on digits, optional BIN/last-4 preservation, valid Luhn check digit"
-    default_params = {"preserve_first": 0, "preserve_last": 0, "luhn": True}
+    description = ("Card numbers (PAN): FPE on digits with valid Luhn check digit; "
+                   "mode=full | last4 | first6_last4")
+    default_params = {"mode": "full", "preserve_first": 0, "preserve_last": 0, "luhn": True,
+                      "output_format": "preserve"}
+    format_params = frozenset({"output_format"})
     families = ("string", "int", "decimal")
     injective = True
     collision_check = True  # inputs failing Luhn take a different path
 
     @classmethod
     def _check_params(cls, p):
-        _non_negative_int(p, "preserve_first", "preserve_last")
+        _apply_mode(p, MODES)
+        _choice(p, "output_format", ("preserve", "digits", "grouped"))
 
     def _setup(self):
         self._cipher = FeistelCipher(self._key)
@@ -293,8 +396,13 @@ class CreditCardMasker(BaseMasker):
     def luhn_valid(cls, number: str) -> bool:
         return len(number) > 1 and cls.luhn_check_digit(number[:-1]) == number[-1]
 
+    def canonical(self, value):
+        return re.sub(r"\D", "", value)
+
     def _mask(self, value):
-        digits = re.sub(r"\D", "", value)
+        digits = self.canonical(value)
+        if not digits:
+            return value
         pf, pl = self.params["preserve_first"], self.params["preserve_last"]
         if self.params["luhn"] and pl == 0 and 12 <= len(digits) <= 19 and self.luhn_valid(digits):
             body = encrypt_text(self._cipher, digits[:-1], b"cc", pf, 0, True, False)
@@ -303,6 +411,11 @@ class CreditCardMasker(BaseMasker):
             # Keeping the last N digits (or a non-Luhn input) means the check digit
             # cannot be recomputed; plain bijective FPE is used instead.
             out = encrypt_text(self._cipher, digits, b"cc-raw", pf, pl, True, False)
+        fmt = self.params["output_format"]
+        if fmt == "digits":
+            return out
+        if fmt == "grouped":
+            return " ".join(out[i:i + 4] for i in range(0, len(out), 4))
         return _reinsert_digits(value, out)
 
 
@@ -312,7 +425,7 @@ class CreditCardMasker(BaseMasker):
 class EmailMasker(BaseMasker):
     type_name = "email"
     description = "Email: deterministic token local-part @ safe domain (case-insensitive, unique)"
-    default_params = {"domain": "example.com", "preserve_domain": False, "prefix": "user", "token_length": 12}
+    default_params = {"domain": "example.com", "preserve_domain": False, "prefix": "user", "token_length": 16}
     collision_check = True
     injective = True
 
@@ -432,8 +545,7 @@ class ZipMasker(BaseMasker):
 
     @classmethod
     def _check_params(cls, p):
-        if p["mode"] not in ("truncate", "fpe"):
-            raise MaskerError("zip.mode must be 'truncate' or 'fpe'")
+        _choice(p, "mode", ("truncate", "fpe"))
         _non_negative_int(p, "keep_digits")
         if not (isinstance(p["fill"], str) and len(p["fill"]) == 1 and p["fill"].isdigit()):
             raise MaskerError("zip.fill must be a single digit")
@@ -462,18 +574,34 @@ _DATE_US = re.compile(r"^(\s*)(\d{1,2})/(\d{1,2})/(\d{4})(.*)$", re.S)
 _DATE_COMPACT = re.compile(r"^(\s*)(\d{4})(\d{2})(\d{2})(\s*)$")
 
 
+def normalize_entity(value: str, how: str) -> str:
+    if how == "digits":
+        d = re.sub(r"\D", "", value)
+        return (d.lstrip("0") or "0") if d else value.strip().lower()
+    if how == "trim_lower":
+        return value.strip().lower()
+    return value
+
+
 class DateShiftMasker(BaseMasker):
     type_name = "date_shift"
-    description = "Shift dates by a deterministic +/- N day offset derived from the value, or generalise"
-    default_params = {"max_days": 365, "generalize": "none"}
+    description = ("Shift dates by a deterministic +/- N day offset. shift_by=entity uses ONE offset per person "
+                   "(column's entity_column), preserving intervals between that person's dates")
+    default_params = {"max_days": 365, "generalize": "none", "shift_by": "value", "entity_normalize": "trim_lower"}
     families = ("string", "date")
+    uses_entity = True
 
     @classmethod
     def _check_params(cls, p):
-        if not isinstance(p["max_days"], int) or p["max_days"] < 1:
+        if not isinstance(p["max_days"], int) or isinstance(p["max_days"], bool) or p["max_days"] < 1:
             raise MaskerError("date_shift.max_days must be a positive integer")
-        if p["generalize"] not in ("none", "year", "month"):
-            raise MaskerError("date_shift.generalize must be none, year or month")
+        _choice(p, "generalize", ("none", "year", "month"))
+        _choice(p, "shift_by", ("value", "entity"))
+        _choice(p, "entity_normalize", ("none", "trim_lower", "digits"))
+
+    @classmethod
+    def entity_required(cls, params):
+        return params.get("shift_by") == "entity"
 
     def _parse(self, value):
         m = _DATE_ISO.match(value)
@@ -496,7 +624,16 @@ class DateShiftMasker(BaseMasker):
         except (MaskerError, ValueError):
             return value
 
-    def _mask(self, value):
+    def offset_days(self, seed: str) -> int:
+        span = self.params["max_days"]
+        o = self._int("date", seed) % (2 * span)
+        return o - span if o < span else o - span + 1  # never zero
+
+    def mask(self, value, entity=None):
+        if value is None:
+            return None
+        if value.strip() == "":
+            return value
         try:
             lead, date, rest, style = self._parse(value)
         except ValueError as exc:
@@ -507,9 +644,11 @@ class DateShiftMasker(BaseMasker):
         elif gen == "month":
             new = _dt.date(date.year, date.month, 1)
         else:
-            span = self.params["max_days"]
-            o = self._int("date", date.isoformat()) % (2 * span)
-            offset = o - span if o < span else o - span + 1  # never zero
+            if self.params["shift_by"] == "entity" and entity is not None and entity.strip() != "":
+                seed = "entity\x1f" + normalize_entity(entity, self.params["entity_normalize"])
+            else:
+                seed = date.isoformat()  # no person id on this row: fall back to per-value shift
+            offset = self.offset_days(seed)
             try:
                 new = date + _dt.timedelta(days=offset)
             except OverflowError:
@@ -541,8 +680,135 @@ class NullifyMasker(BaseMasker):
     description = "Set the column to NULL"
     families = ("string", "int", "decimal", "date", "other")
 
-    def mask(self, value):
+    def mask(self, value, entity=None):
         return None
+
+
+# =============================================================================
+# Free text (notes, comments, descriptions)
+# =============================================================================
+BUILTIN_DETECTORS: Dict[str, str] = {
+    # order = priority when patterns overlap
+    "email": r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+    "credit_card": r"(?<!\d)(?:\d[ -]?){12,18}\d(?!\d)",
+    "ssn": r"(?<!\d)\d{3}[- ]\d{2}[- ]\d{4}(?!\d)",
+    "phone": r"(?<![\w])(?:\+?\d{1,3}[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}(?!\d)",
+    "ip_address": r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])",
+    "date": r"(?<!\d)(?:\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{4})(?!\d)",
+}
+DEFAULT_DETECTORS = {
+    "email": {"action": "tag", "tag": "[EMAIL]"},
+    "credit_card": {"action": "tag", "tag": "[CARD]"},
+    "ssn": {"action": "tag", "tag": "[SSN]"},
+    "phone": {"action": "tag", "tag": "[PHONE]"},
+}
+
+
+class FreeTextMasker(BaseMasker):
+    """Options (all via config):
+
+    mode: scrub (default) | redact | nullify | hash
+    detectors:            which built-in PII patterns to find and what to do with each hit
+        email:  {action: mask, domain: email}   # same token as the Email columns
+        ssn:    {action: tag, tag: "[SSN]"}     # replace with a fixed tag
+        phone:  {action: remove}                # delete the hit
+    custom_patterns:      [{name: member_id, regex: "MBR\\d{8}", action: mask, domain: account_number}]
+    on_overflow:          truncate (default) | error  - if the scrubbed text exceeds the column length
+    """
+
+    type_name = "free_text"
+    description = ("Notes/comments: mode=scrub finds email/SSN/card/phone/IP/date/custom regex hits and tags, "
+                   "removes or masks them with another domain; or mode=redact|nullify|hash")
+    default_params = {
+        "mode": "scrub", "replacement": "[REDACTED]", "detectors": DEFAULT_DETECTORS,
+        "custom_patterns": [], "on_overflow": "truncate",
+    }
+
+    @classmethod
+    def _check_params(cls, p):
+        _choice(p, "mode", ("scrub", "redact", "nullify", "hash"))
+        _choice(p, "on_overflow", ("truncate", "error"))
+        if not isinstance(p["detectors"], dict):
+            raise MaskerError("free_text.detectors must be a mapping of detector -> {action: ...}")
+        for name, spec in p["detectors"].items():
+            if name not in BUILTIN_DETECTORS:
+                raise MaskerError("Unknown free_text detector '%s'. Built-in: %s" % (name, ", ".join(BUILTIN_DETECTORS)))
+            cls._check_action(name, spec)
+        if not isinstance(p["custom_patterns"], list):
+            raise MaskerError("free_text.custom_patterns must be a list")
+        for cp in p["custom_patterns"]:
+            if not isinstance(cp, dict) or not cp.get("name") or not cp.get("regex"):
+                raise MaskerError("each custom_pattern needs 'name' and 'regex'")
+            try:
+                re.compile(cp["regex"])
+            except re.error as exc:
+                raise MaskerError("custom_pattern '%s' has an invalid regex: %s" % (cp["name"], exc))
+            cls._check_action(cp["name"], cp)
+
+    @staticmethod
+    def _check_action(name, spec):
+        if not isinstance(spec, dict):
+            raise MaskerError("detector '%s' must be a mapping like {action: tag}" % name)
+        action = spec.get("action", "tag")
+        if action not in ("tag", "remove", "mask"):
+            raise MaskerError("detector '%s': action must be tag, remove or mask" % name)
+        if action == "mask" and not spec.get("domain"):
+            raise MaskerError("detector '%s': action=mask needs a 'domain' to mask hits with" % name)
+
+    @classmethod
+    def referenced_domains(cls, params):
+        specs = list((params.get("detectors") or {}).values()) + list(params.get("custom_patterns") or [])
+        return [s["domain"] for s in specs if isinstance(s, dict) and s.get("action") == "mask"]
+
+    def _setup(self):
+        self.resolver: Dict[str, BaseMasker] = {}
+        self._rules: List[Tuple[str, Dict[str, Any]]] = []
+        parts = []
+        for i, (name, spec) in enumerate(self.params["detectors"].items()):
+            parts.append("(?P<b%d>%s)" % (i, BUILTIN_DETECTORS[name]))
+            self._rules.append((name, spec))
+        offset = len(self._rules)
+        for j, cp in enumerate(self.params["custom_patterns"]):
+            parts.append("(?P<b%d>%s)" % (offset + j, cp["regex"]))
+            self._rules.append((cp["name"], cp))
+        self._regex = re.compile("|".join(parts)) if parts else None
+
+    def set_resolver(self, maskers: Dict[str, BaseMasker]) -> None:
+        missing = [d for d in self.referenced_domains(self.params) if d not in maskers]
+        if missing:
+            raise MaskerError("free_text domain '%s' references undefined domain(s): %s" % (self.domain, missing))
+        self.resolver = maskers
+
+    def _replace(self, m):
+        idx = int(m.lastgroup[1:])
+        name, spec = self._rules[idx]
+        hit = m.group(0)
+        if name == "credit_card" and not CreditCardMasker.luhn_valid(re.sub(r"\D", "", hit)):
+            return hit  # long digit runs that are not card numbers
+        action = spec.get("action", "tag")
+        if action == "remove":
+            return ""
+        if action == "mask":
+            masker = self.resolver.get(spec["domain"])
+            if masker is None:
+                raise MaskerError("free_text: domain '%s' is not available" % spec["domain"])
+            masked = masker.mask(hit)
+            return "" if masked is None else masked
+        return str(spec.get("tag") or "[%s]" % name.upper())
+
+    def mask(self, value, entity=None):
+        if value is None:
+            return None
+        mode = self.params["mode"]
+        if mode == "nullify":
+            return None
+        if value.strip() == "":
+            return value
+        if mode == "redact":
+            return str(self.params["replacement"])
+        if mode == "hash":
+            return binascii.hexlify(self._digest("text", value)).decode()[:32]
+        return self._regex.sub(self._replace, value) if self._regex else value
 
 
 # =============================================================================
@@ -553,7 +819,7 @@ MASKERS: Dict[str, Type[BaseMasker]] = {
     for cls in (
         EmailMasker, SsnMasker, AccountNumberMasker, CreditCardMasker, PhoneMasker, FpeMasker, HashMasker,
         FirstNameMasker, LastNameMasker, FullNameMasker, StreetAddressMasker, CityMasker, ZipMasker,
-        DateShiftMasker, RedactMasker, NullifyMasker,
+        DateShiftMasker, RedactMasker, NullifyMasker, FreeTextMasker,
     )
 }
 
@@ -569,6 +835,29 @@ def create_masker(type_name: str, domain: str, keyring: KeyRing, params: Optiona
     return get_masker_class(type_name)(domain, keyring.domain_key(domain), params)
 
 
+def build_maskers(domains, keyring: KeyRing) -> Dict[str, BaseMasker]:
+    """One masker per domain (DomainRule-like objects with name/type/params), with free-text links resolved."""
+    maskers = {d.name: create_masker(d.type, d.name, keyring, d.params) for d in domains}
+    for m in maskers.values():
+        if isinstance(m, FreeTextMasker):
+            m.set_resolver(maskers)
+    return maskers
+
+
+def column_masker(base: BaseMasker, keyring: KeyRing, overrides: Dict[str, Any]) -> BaseMasker:
+    """A masker for one column with format-only overrides; identical identity (same domain key)."""
+    if not overrides:
+        return base
+    bad = set(overrides) - set(base.format_params)
+    if bad:
+        raise MaskerError("Column overrides %s are not allowed for '%s' (allowed: %s)"
+                          % (sorted(bad), base.type_name, sorted(base.format_params) or "none"))
+    m = type(base)(base.domain, keyring.domain_key(base.domain), dict(base.params, **overrides))
+    if isinstance(base, FreeTextMasker):
+        m.set_resolver(base.resolver)
+    return m
+
+
 def is_injective(type_name: str, params: Optional[Dict[str, Any]] = None) -> bool:
     cls = get_masker_class(type_name)
     if cls is ZipMasker:
@@ -577,5 +866,6 @@ def is_injective(type_name: str, params: Optional[Dict[str, Any]] = None) -> boo
 
 
 __all__ = [
-    "KeyRing", "MaskerError", "BaseMasker", "MASKERS", "get_masker_class", "create_masker", "is_injective",
+    "ALGORITHM_VERSION", "KeyRing", "MaskerError", "BaseMasker", "MASKERS", "MODES", "get_masker_class",
+    "create_masker", "build_maskers", "column_masker", "is_injective", "normalize_entity",
 ]

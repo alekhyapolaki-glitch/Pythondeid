@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
-from .maskers import MaskerError, get_masker_class
+from .maskers import ALGORITHM_VERSION, MaskerError, get_masker_class
 
 
 class ConfigError(Exception):
@@ -37,21 +37,32 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "application_name": "pythondeid",
         "extra": {},
     },
-    "security": {"secret_key_env": "DEID_SECRET_KEY", "min_key_length": 32},
+    "security": {"secret_key_env": "DEID_SECRET_KEY", "min_key_length": 32, "expected_key_fingerprint": ""},
     "execution": {
-        "batch_size": 50000,
-        "fetch_size": 5000,
+        "batch_size": "auto",            # rows per chunk, or "auto" = sized per table (see batching below)
+        "fetch_size": 20000,
+        "workers": "auto",               # masking processes: "auto" = CPU count - 1 (max 8), or a number
+        "disable_unique_indexes": True,  # allow batched updates of masked columns with unique NC indexes
         "disable_triggers": True,
         "auto_include_fk_columns": True,
         "stop_on_error": True,
         "collision_check": True,
         "max_retries": 3,
         "retry_backoff_seconds": 2,
+        "collision_check_max_values": 5000000,
         "allow_single_statement_rows": 50000000,
+        "type_mismatch": "error",        # expected_input_type differs from the live column: error | warn
+    },
+    "batching": {                        # used when execution.batch_size = auto
+        "target_batch_mb": 256,          # approx. data rewritten (and logged) per committed chunk
+        "min_batch_size": 10000,
+        "max_batch_size": 500000,
     },
     "audit": {"write_to_db": True, "schema": "deid_audit", "output_dir": "audit"},
     "logging": {"level": "INFO", "dir": "logs"},
 }
+
+_SECTIONS = ("database", "security", "execution", "batching", "audit", "logging")
 
 _AUTH_MODES = ("windows", "sql", "azure_ad_interactive", "azure_ad_password")
 
@@ -61,12 +72,13 @@ class Settings:
     database: Dict[str, Any]
     security: Dict[str, Any]
     execution: Dict[str, Any]
+    batching: Dict[str, Any]
     audit: Dict[str, Any]
     logging: Dict[str, Any]
     source_path: Optional[Path] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return {k: copy.deepcopy(getattr(self, k)) for k in ("database", "security", "execution", "audit", "logging")}
+        return {k: copy.deepcopy(getattr(self, k)) for k in _SECTIONS}
 
 
 def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
@@ -110,9 +122,20 @@ def load_settings(path: str) -> Settings:
             "database.password_env (default DEID_DB_PASSWORD)."
         )
     ex = merged["execution"]
-    for k in ("batch_size", "fetch_size", "max_retries"):
+    for k in ("fetch_size", "max_retries", "collision_check_max_values"):
         if not isinstance(ex[k], int) or ex[k] < (0 if k == "max_retries" else 1):
             raise ConfigError("execution.%s must be a positive integer" % k)
+    for k in ("batch_size", "workers"):
+        if ex[k] != "auto" and (not isinstance(ex[k], int) or ex[k] < 1):
+            raise ConfigError("execution.%s must be 'auto' or a positive integer" % k)
+    if ex["type_mismatch"] not in ("error", "warn"):
+        raise ConfigError("execution.type_mismatch must be 'error' or 'warn'")
+    b = merged["batching"]
+    for k in ("target_batch_mb", "min_batch_size", "max_batch_size"):
+        if not isinstance(b[k], int) or b[k] < 1:
+            raise ConfigError("batching.%s must be a positive integer" % k)
+    if b["min_batch_size"] > b["max_batch_size"]:
+        raise ConfigError("batching.min_batch_size must be <= max_batch_size")
     if not str(merged["audit"]["schema"]).replace("_", "").isalnum():
         raise ConfigError("audit.schema must be a simple identifier")
     return Settings(source_path=p, **merged)
@@ -143,6 +166,22 @@ class DomainRule:
 class ColumnRule:
     name: str
     domain: str
+    #: data type you expect the live column to have, e.g. "varchar(11)"; checked by validate
+    expected_input_type: str = ""
+    #: data type the masked values must fit, e.g. "char(11)" (default: the column's own type)
+    output_type: str = ""
+    #: format-only masker params for this column (e.g. ssn output_format); identity is unchanged
+    overrides: Dict[str, Any] = field(default_factory=dict)
+    #: column in the same table identifying the person/entity (date_shift shift_by: entity)
+    entity_column: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        d: Dict[str, Any] = {"name": self.name, "domain": self.domain}
+        for k in ("expected_input_type", "output_type", "entity_column"):
+            if getattr(self, k):
+                d[k] = getattr(self, k)
+        d.update(self.overrides)
+        return d
 
 
 @dataclass
@@ -163,9 +202,11 @@ class Rules:
     tables: List[TableRule]
     source_path: Optional[Path] = None
     content_hash: str = ""
+    algorithm_version: int = ALGORITHM_VERSION
 
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "algorithm_version": self.algorithm_version,
             "domains": {
                 d.name: ({"type": d.type, "params": d.params} if d.params else {"type": d.type})
                 for d in self.domains.values()
@@ -174,7 +215,7 @@ class Rules:
                 dict(
                     {"schema": t.schema, "table": t.table},
                     **({"key_columns": t.key_columns} if t.key_columns else {}),
-                    columns=[{"name": c.name, "domain": c.domain} for c in t.columns],
+                    columns=[c.to_dict() for c in t.columns],
                 )
                 for t in self.tables
             ],
@@ -202,9 +243,14 @@ def _define_domain(domains: Dict[str, DomainRule], name: str, mtype: str, params
 
 
 def parse_rules(raw: Dict[str, Any], source: str = "<rules>") -> Rules:
-    unknown = set(raw) - {"domains", "tables"}
+    unknown = set(raw) - {"domains", "tables", "algorithm_version"}
     if unknown:
         raise ConfigError("Unknown top-level key(s) in %s: %s" % (source, sorted(unknown)))
+    version = raw.get("algorithm_version", ALGORITHM_VERSION)
+    if version != ALGORITHM_VERSION:
+        raise ConfigError(
+            "%s pins algorithm_version %s but this tool implements version %s. Every server must run the same "
+            "algorithm version or masked values will differ." % (source, version, ALGORITHM_VERSION))
     domains: Dict[str, DomainRule] = {}
     for name, spec in (raw.get("domains") or {}).items():
         if isinstance(spec, str):
@@ -249,14 +295,44 @@ def parse_rules(raw: Dict[str, Any], source: str = "<rules>") -> Rules:
                     _define_domain(domains, dname, dname, {}, cw + " (domain '%s' not defined; treated as a mask type)" % dname)
             else:
                 raise ConfigError("%s: column '%s' needs a 'domain' or a 'type'" % (cw, c["name"]))
-            cols.append(ColumnRule(str(c["name"]), dname))
+            extra = set(c) - _COLUMN_KEYS
+            dom = domains[dname]
+            fmt_allowed = get_masker_class(dom.type).format_params
+            bad = extra - set(fmt_allowed)
+            if bad:
+                raise ConfigError("%s: unknown key(s) %s for column '%s'. Column-level keys: %s; format overrides "
+                                  "for %s: %s" % (cw, sorted(bad), c["name"], sorted(_COLUMN_KEYS), dom.type,
+                                                  sorted(fmt_allowed) or "none"))
+            overrides = {k: c[k] for k in extra}
+            if overrides:
+                try:
+                    get_masker_class(dom.type).validate_params(dict(dom.params, **overrides))
+                except MaskerError as exc:
+                    raise ConfigError("%s: %s" % (cw, exc))
+            entity = str(c.get("entity_column") or "")
+            needs_entity = get_masker_class(dom.type).entity_required(get_masker_class(dom.type).validate_params(dom.params))
+            if needs_entity and not entity:
+                raise ConfigError("%s: domain '%s' uses shift_by: entity, so column '%s' needs entity_column "
+                                  "(the person id column in this table)" % (cw, dname, c["name"]))
+            if entity and not needs_entity:
+                raise ConfigError("%s: entity_column is only valid for date_shift domains with shift_by: entity" % cw)
+            cols.append(ColumnRule(str(c["name"]), dname, str(c.get("expected_input_type") or ""),
+                                   str(c.get("output_type") or ""), overrides, entity))
         if not cols:
             raise ConfigError("%s: table %s.%s has no columns" % (where, schema, table))
         tables.append(TableRule(schema, table, cols, [str(k) for k in (t.get("key_columns") or [])]))
 
+    for d in domains.values():
+        for ref in get_masker_class(d.type).referenced_domains(get_masker_class(d.type).validate_params(d.params)):
+            if ref not in domains:
+                raise ConfigError("%s: domain '%s' masks free-text hits with domain '%s', which is not defined"
+                                  % (source, d.name, ref))
     rules = Rules(domains=domains, tables=tables)
     rules.content_hash = rules.compute_hash()
     return rules
+
+
+_COLUMN_KEYS = {"name", "domain", "type", "params", "expected_input_type", "output_type", "entity_column"}
 
 
 def load_rules(path: str) -> Rules:
@@ -280,7 +356,8 @@ def save_rules(rules: Rules, path: str, header: str = "") -> None:
 # CSV input (table structure + fields) -> rules
 # =============================================================================
 CSV_COLUMNS = ["schema", "table", "column", "data_type", "max_length", "is_nullable", "is_primary_key",
-               "suggested_type", "mask_type", "domain", "params_json"]
+               "suggested_type", "mask_type", "domain", "params_json", "expected_input_type", "output_type",
+               "entity_column"]
 
 
 def rules_from_csv(path: str) -> Rules:
@@ -317,5 +394,8 @@ def rules_from_csv(path: str) -> Rules:
                     col["params"] = params
             if domain:
                 col["domain"] = domain
+            for k in ("expected_input_type", "output_type", "entity_column"):
+                if (row.get(k) or "").strip():
+                    col[k] = row[k].strip()
             entry["columns"].append(col)
     return parse_rules({"tables": list(raw_tables.values())}, path)

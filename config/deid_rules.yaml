@@ -3,32 +3,47 @@
 #
 # domains:  named masking definitions.  Every column that uses the same domain
 #           is masked with the same algorithm + parameters + derived key, so a
-#           value (e.g. an SSN) gets the SAME masked value in every table.
+#           value gets the SAME masked value in every table, database and
+#           server that uses the same secret key and this rules file.
 #           => give columns that join to each other the same domain.
-# tables:   table -> list of columns -> domain.
-#           Inline form is also allowed:  {name: Col, type: email, params: {...}}
-#           key_columns: optional unique NOT NULL column used for batched updates
-#           when the table has no primary key.
+# tables:   table -> columns -> domain.  Column-level options:
+#             expected_input_type: varchar(11)  live column must have this type (validate checks it)
+#             output_type:         char(11)     masked values must also fit this type
+#             output_format:       digits       format-only override (ssn, credit_card); identity unchanged
+#             entity_column:       CustomerId   person id for date_shift with shift_by: entity
+#           key_columns: optional unique NOT NULL column for batched updates when the table has no PK.
 #
-# Mask types: python main.py list-types
-# Build this file interactively:  python main.py wizard
-#   ... or from a CSV:            python main.py discover  ->  edit  ->  import-csv
+# Mask types, parameters, input/output type guide:  python main.py list-types
+# Type/format/batch-size recommendations for THIS file:  python main.py recommend
 # ---------------------------------------------------------------------------
+algorithm_version: 1      # pin: all servers must run the same masking algorithm version
+
 domains:
   email:
     type: email
-    params: {domain: example.com, token_length: 12}
+    params: {domain: example.com, token_length: 16}
+
   ssn:
     type: ssn
-    params: {output_format: preserve, realistic: true}
+    params:
+      mode: full            # full = de-identify all 9 digits | last4 = keep the last 4 digits
+      output_format: preserve
+      realistic: true
+
   account_number:
     type: account_number
-    params: {preserve_last: 0}
+    params:
+      mode: last4           # full = de-identify everything | last4 = keep the last 4 characters
+
+  member_no:                # stored as BIGINT in Customers and zero-padded VARCHAR(12) in Accounts
+    type: account_number
+    params: {normalize: digits, pad_to: 12, mode: full}
+
   card_number:
     type: credit_card
-    params: {preserve_first: 6}
-  phone:
-    type: phone
+    params: {mode: first6_last4}   # full | last4 | first6_last4
+
+  phone: {type: phone}
   first_name: {type: first_name}
   last_name: {type: last_name}
   street_address: {type: street_address}
@@ -36,9 +51,22 @@ domains:
   zip:
     type: zip
     params: {mode: truncate, keep_digits: 3}
-  dob:
+
+  person_dates:             # one offset per person => intervals between a person's dates are preserved
     type: date_shift
-    params: {max_days: 180}
+    params: {shift_by: entity, max_days: 180, entity_normalize: trim_lower}
+
+  notes:
+    type: free_text
+    params:
+      mode: scrub           # scrub | redact | nullify | hash
+      on_overflow: truncate
+      detectors:
+        email: {action: mask, domain: email}     # same token as the Email columns
+        ssn: {action: mask, domain: ssn}         # same masked SSN as the SSN columns
+        phone: {action: tag, tag: "[PHONE]"}
+        credit_card: {action: tag, tag: "[CARD]"}
+      custom_patterns: []   # e.g. [{name: mrn, regex: "MRN\\d{8}", action: tag, tag: "[MRN]"}]
 
 tables:
   - schema: dbo
@@ -46,13 +74,14 @@ tables:
     columns:
       - {name: FirstName, domain: first_name}
       - {name: LastName, domain: last_name}
-      - {name: Email, domain: email}
-      - {name: SSN, domain: ssn}
+      - {name: Email, domain: email, expected_input_type: varchar(100)}
+      - {name: SSN, domain: ssn, expected_input_type: char(11), output_type: char(11)}
       - {name: Phone, domain: phone}
       - {name: Street, domain: street_address}
       - {name: City, domain: city}
       - {name: Zip, domain: zip}
-      - {name: DateOfBirth, domain: dob}
+      - {name: DateOfBirth, domain: person_dates, entity_column: CustomerId}
+      - {name: MemberNo, domain: member_no, expected_input_type: bigint}
 
   - schema: dbo
     table: Accounts
@@ -60,6 +89,7 @@ tables:
       - {name: AccountNumber, domain: account_number}   # primary key, referenced by Transactions
       - {name: OwnerSSN, domain: ssn}                    # same domain as Customers.SSN => joins still work
       - {name: CardNumber, domain: card_number}
+      - {name: MemberNo, domain: member_no, expected_input_type: varchar(12)}
 
   - schema: dbo
     table: Transactions
@@ -68,7 +98,14 @@ tables:
       - {name: NotifyEmail, domain: email}
 
   - schema: dbo
+    table: Visits
+    columns:
+      - {name: AdmitDate, domain: person_dates, entity_column: CustomerId}
+      - {name: DischargeDate, domain: person_dates, entity_column: CustomerId}
+      - {name: Notes, domain: notes}
+
+  - schema: dbo
     table: MarketingContacts                          # heap without PK: single-statement strategy
     columns:
       - {name: Email, domain: email}
-      - {name: Notes, type: redact}
+      - {name: Notes, domain: notes}

@@ -1,278 +1,329 @@
 # pythondeid: SQL Server de-identification with referential integrity
 
-A Python tool, built to run on an **ActiveState** Python runtime, that masks PII in a SQL Server
-database **in place**. The same original value always gets the same masked value in every table,
-so joins and foreign keys keep working after masking.
+A Python tool, built to run on an **ActiveState** Python runtime, that masks PII in SQL Server
+databases **in place**. A given input value always produces the same masked value in every
+table, database and server that uses the same secret key and rules, so joins and foreign keys
+keep working after masking. It is built for SQL Server 2022 and large tables.
 
 | Requirement | Where it lives |
 |---|---|
-| 1. Table structure and fields as input | `discover` writes the live schema to CSV. Rules go in `config/deid_rules.yaml` (or `import-csv`). |
-| 2. Columns to de-identify | `config/deid_rules.yaml`: table → column → *domain* |
-| 3. Same masking across tables | Deterministic keyed algorithms per *domain* (`deid/maskers.py`, `deid/fpe.py`) |
-| 4. Update the data in SQL Server | `deid/engine.py`: set-based, batched, resumable updates |
-| 5. Ask questions | `configure`, `wizard`, and the confirmation prompts before `run` |
-| 6. Separate config and reusable utilities | `config/*.yaml` + `deid/` package (db, schema, maskers, audit, prompts) |
-| 7. Audit results | `deid_audit.*` tables in the DB, plus `audit/<run_id>/` files |
+| Table structure and fields as input | `discover` writes the live schema to CSV. Rules go in `config/deid_rules.yaml` (or `wizard` / `import-csv`). |
+| Columns to de-identify | `config/deid_rules.yaml`: table → column → *domain* |
+| Same masking across tables, databases and servers | Deterministic keyed algorithms per *domain*, plus key fingerprint pinning, `algorithm_version` and `test-vectors` |
+| Full de-identification or keep last 4 (SSN, account, card) | `mode: full \| last4` (cards also `first6_last4`) per domain |
+| Input/output data types and recommendations | `expected_input_type`, `output_type` and `output_format` per column; `recommend`; `list-types` |
+| Per-person date shifting | `date_shift` with `shift_by: entity` + `entity_column` |
+| Free-text options | `free_text` with `mode: scrub \| redact \| nullify \| hash` and per-detector actions |
+| Big tables | `batch_size: auto` sized per table, parallel masking workers, unique-index handling, DB readiness checks |
+| Update SQL Server, ask questions, audit | `run` with confirmations, `configure`/`wizard`, `deid_audit.*` tables + `audit/<run_id>/` files |
 
 ---
 
-## 1. How the masking keeps referential integrity
+## 1. Consistency across tables, databases and servers
 
-**Domains.** A domain is a named masking definition, for example `email`, `ssn` or
-`account_number`. Every column that holds the same kind of identifier is assigned to the same
-domain. That applies across tables too, e.g. `Customers.SSN` and `Accounts.OwnerSSN`.
+**Domains.** A domain is a named masking definition (type + parameters). Every column that holds
+the same kind of identifier uses the same domain, wherever it lives. Each domain has its own key:
+`HMAC-SHA256(master_secret, "v1|" + domain_name)`.
 
-**Deterministic keyed masking.** Each domain gets its own key, derived as
-`domain_key = HMAC-SHA256(master_secret, domain_name)`. The masked value is a pure function of
-`(domain_key, normalised original value)`, which means:
+A masked value depends only on the **secret key, the algorithm version, the domain (name and
+parameters) and the canonical input value**. Nothing else feeds in: no randomness, server name,
+run id or row order. So the same value gives the same mask in every table, database and server,
+on every run.
 
-* the same value gives the same mask in every table, every batch, every run, and every database
-  masked with the same secret (so separately masked copies still line up);
-* the mask can't be reversed without the secret, and changing the secret changes every mask;
-* domains are independent: the same text in two different domains masks differently.
+Four ways to keep every environment configured identically:
 
-**Algorithms**
+| Mechanism | What it does |
+|---|---|
+| Same `DEID_SECRET_KEY` everywhere | Store it in your vault and inject it on each server. |
+| `security.expected_key_fingerprint` | Pin the fingerprint printed by `python main.py key-fingerprint`. A server with a different key refuses to run. |
+| `algorithm_version: 1` in the rules | Refuses to run if the tool's algorithm differs. |
+| `python main.py test-vectors` | Writes known-answer masks for every domain, using synthetic inputs only. `test-vectors --check file.csv` on another server proves it produces byte-identical output. |
 
-| Type | Algorithm | Unique / FK-safe |
-|---|---|---|
-| `ssn` | Format-preserving encryption (FPE) on the 9 digits, using an FF1-style Feistel network over radix 10. *Cycle-walking* keeps valid SSNs inside the valid SSA ranges (area ≠ 000/666/9xx, group ≠ 00, serial ≠ 0000). `123-45-6789` and `123456789` mask to the same digits, and the original format is kept. | ✅ bijective |
-| `account_number`, `fpe` | FPE on letters (radix 26, case kept) and digits (radix 10). Separators and length stay the same. Optional `preserve_first` / `preserve_last`, with the kept characters bound into the tweak. | ✅ bijective |
-| `credit_card` | FPE on the digit body plus a recomputed **Luhn** check digit. Optional BIN (`preserve_first: 6`) or last-4. | ✅ (collision-checked) |
-| `phone` | FPE on digits only. Punctuation is kept. | ✅ bijective |
-| `email` | `user<base32(HMAC(lowercased email))>@example.com`. Case-insensitive, so `John@X.com` = `john@x.com`. | ✅ (collision-checked) |
-| `hash` | HMAC-SHA256 hex token | ✅ (collision-checked) |
-| `first_name`, `last_name`, `full_name`, `street_address`, `city` | HMAC-indexed pick from built-in lists. Case style is kept. | ❌ realistic, not unique |
-| `zip` | `truncate` keeps the first 3 digits (HIPAA style); `fpe` is bijective | truncate ❌ / fpe ✅ |
-| `date_shift` | Deterministic ±N-day shift derived from the date, or generalise to year/month | ❌ |
-| `redact`, `nullify` | Constant / NULL | ❌ |
+**Canonical input** removes representation differences before masking, so different storage
+types still match:
 
-"Bijective" means it's mathematically impossible for two different inputs to produce the same
-output, which is why these types are safe for primary keys and unique columns. The planner
-**rejects** a non-unique type on a PK or unique column.
+| Same identity | How |
+|---|---|
+| `John.Doe@Mail.COM` = `john.doe@mail.com` | `email` lowercases and trims |
+| `123-45-6789` (char) = `123456789` (varchar) = `123456789` (int) | `ssn` works on the 9 digits; ints are zero-padded |
+| `'000000012345'` (varchar(12)) = `12345` (bigint) | `account_number`/`fpe` with `normalize: digits, pad_to: 12` |
+| `ACC-000123-01` = `ACC00012301` | FPE ignores separator positions |
 
-**How the database update works**
+The run also checks foreign keys. Both columns of every FK must be in the same domain (partner
+columns are added automatically), and a domain used on mixed types without normalisation produces
+a warning.
 
-1. Distinct values are read per column, grouped by `HASHBYTES('SHA2_256', value)`, so
-   case-only and trailing-space variants are never merged.
-2. Python masks each distinct value and checks that the result fits the column (length, int
-   range, decimal precision, NOT NULL, date range). It also detects collisions. It then loads
-   `(column, sha256(original), masked)` into the session temp table `#deid_map`.
-   **Original values are never written anywhere.**
-3. A set-based `UPDATE t ... LEFT JOIN #deid_map` rewrites the table:
-   * **chunked**: uses ranges of an unmasked single-column key, committing each chunk together
-     with an atomic checkpoint. These runs can be resumed.
-   * **single**: one transaction. Used when the key itself is masked, a masked column is unique,
-     or there is no usable key. This avoids transient duplicate-key errors and double masking.
-4. Foreign keys that touch masked columns are set to `NOCHECK` first and re-validated
-   `WITH CHECK` at the end. The run also confirms the FKs are trusted again.
+## 2. Masking algorithms and options
 
-**Built-in safety checks**
+| Type | Algorithm | Options | Unique / FK-safe |
+|---|---|---|---|
+| `ssn` | FF1-style Feistel FPE on the 9 digits. Cycle-walking keeps valid SSNs valid (area ≠ 000/666/9xx). | `mode: full \| last4`, `output_format: preserve \| dashed \| digits` (per column allowed), `realistic` | ✅ bijective |
+| `account_number`, `fpe` | FPE on digits (radix 10) and letters (radix 26). Format, separators and case are kept. | `mode: full \| last4`, `normalize: digits` + `pad_to`, `preserve_first/last` | ✅ bijective |
+| `credit_card` | FPE + recomputed Luhn check digit | `mode: full \| last4 \| first6_last4`, `output_format: preserve \| digits \| grouped` | ✅ |
+| `phone` | FPE on digits; punctuation kept | `preserve_first/last` | ✅ bijective |
+| `email` | `user<HMAC token>@example.com` | `token_length` (16), `domain`, `preserve_domain` | ✅ collision-checked |
+| `hash` | HMAC-SHA256 hex | `length`, `prefix` | ✅ collision-checked |
+| `first_name`, `last_name`, `full_name`, `street_address`, `city` | Deterministic pick from lists | — | ❌ not unique |
+| `zip` | `truncate` (first 3 digits) or `fpe` | `mode`, `keep_digits` | fpe ✅ |
+| `date_shift` | ±N-day shift | `shift_by: value \| entity`, `max_days`, `generalize: none \| year \| month` | ❌ |
+| `free_text` | Regex scrub of PII inside text | see §5 | ❌ |
+| `redact`, `nullify` | Constant / NULL | `value`, `preserve_length` | ❌ |
 
-* Both columns of every FK must use the same domain. With `auto_include_fk_columns` on (the
-  default), the partner column is added automatically.
-* `ON UPDATE CASCADE` FKs on masked columns are rejected, because cascading would double-mask.
-* IDENTITY and computed columns are rejected.
-* A rules set that was already applied can't be re-run without `--force`, because masking masked
-  data again breaks consistency. Interrupted runs continue with `--resume <run_id>`.
-* Enabled triggers are disabled for the update and re-enabled afterwards.
-* Deadlocks are retried with backoff.
-* `dry-run` does the full masking in memory, validates every value, and **writes nothing to the
-  database**.
+**Last-4 option.** Choose per domain in `config/deid_rules.yaml`:
+
+```yaml
+ssn:            {type: ssn, params: {mode: full}}          # or: mode: last4  -> ***-**-6789 kept
+account_number: {type: account_number, params: {mode: last4}}  # or: mode: full
+card_number:    {type: credit_card, params: {mode: first6_last4}}
+```
+
+The masked part stays collision-free in both modes. Keeping the last 4 digits weakens the
+protection: `last4` SSNs are not HIPAA Safe Harbor de-identified, so `full` is the default.
+**Columns that join must use the same mode** (they share one domain).
+
+## 3. Input and output data types
+
+Column-level options in the rules file:
+
+```yaml
+- {name: SSN, domain: ssn, expected_input_type: char(11), output_type: char(11)}
+- {name: OwnerSSN, domain: ssn, output_format: digits}     # format-only; still matches SSN joins
+- {name: MemberNo, domain: member_no, expected_input_type: bigint}
+```
+
+| Option | Meaning |
+|---|---|
+| `expected_input_type` | The type you expect in the source. `validate` fails (or warns, with `execution.type_mismatch: warn`) if the live column differs. This catches schema drift between servers. `discover`/`wizard` fill it in from the live schema. |
+| `output_type` | Masked values must also fit this type, e.g. for downstream systems. Checked for every value during `dry-run`. |
+| `output_format` | A rendering option for `ssn` and `credit_card`. It doesn't change the masked identity. |
+
+**Recommendations.** `python main.py list-types` prints the accepted input types and recommended
+output types for each mask type. `python main.py recommend --out rec.csv` profiles each target
+column (sampled lengths, formats such as `999-99-9{4}`, digit share, leading zeros) and reports:
+
+* the output length each masker needs, compared with the column (e.g. `email` needs `varchar(32)`);
+* domains whose columns use different types or leading zeros, with the exact
+  `normalize: digits, pad_to: N` to add;
+* differing SSN formats, date columns that would benefit from `shift_by: entity`, and free-text
+  risks.
+
+## 4. Per-person date shifting
+
+```yaml
+person_dates: {type: date_shift, params: {shift_by: entity, max_days: 180}}
+...
+- {name: DateOfBirth, domain: person_dates, entity_column: CustomerId}   # Customers
+- {name: AdmitDate,   domain: person_dates, entity_column: CustomerId}   # Visits
+```
+
+The offset is derived from the person id (`entity_column`), so all of one person's dates (in any
+table, database or server) move by the same number of days. Ages, lengths of stay and the order of
+events are preserved, while the actual dates are hidden. The tool reads the person id before
+masking, in the same statement, even if that column is masked too. Rows with a NULL person id fall
+back to the per-value shift. Time of day is kept.
+
+## 5. Free text (notes, comments)
+
+```yaml
+notes:
+  type: free_text
+  params:
+    mode: scrub              # scrub | redact (constant) | nullify | hash
+    on_overflow: truncate    # or error, if scrubbed text no longer fits the column
+    detectors:               # email, ssn, credit_card (Luhn-checked), phone, ip_address, date
+      email: {action: mask, domain: email}   # hit -> same token as the Email columns
+      ssn:   {action: mask, domain: ssn}     # hit -> same masked SSN as the SSN columns
+      phone: {action: tag, tag: "[PHONE]"}
+      date:  {action: remove}
+    custom_patterns:
+      - {name: mrn, regex: "MRN\\d{8}", action: tag, tag: "[MRN]"}
+```
+
+Regex scrubbing can't find names or PII written in prose (for example "lives next to the
+bakery"). For high-risk text use `mode: redact` or `nullify`, and review a sample after `dry-run`.
+
+## 6. Large tables (SQL Server 2022)
+
+| Feature | Behaviour |
+|---|---|
+| `execution.batch_size: auto` | Per-table batch = `batching.target_batch_mb` (256 MB) ÷ the table's average row size (from catalog page counts), clamped to 10k–500k rows. `validate`/`recommend` show rows, MB, bytes/row, batch size and number of batches. |
+| Chunked strategy | Uses key ranges of an unmasked single-column key. Each batch commits with a checkpoint; `--resume` continues from the last one. |
+| Unique indexes on masked columns | Nonclustered unique indexes are **disabled** during the batched update and **rebuilt** afterwards, which re-validates uniqueness. This avoids transient duplicate-key errors without falling back to one huge transaction. |
+| Single strategy | Used only when the PK itself is masked, a masked column is in a clustered/FK-referenced unique index, or there's no usable key. `recommend` estimates the log space needed. |
+| `execution.workers: auto` | Masking runs in parallel processes (CPU count − 1, max 8) for tables over 100k rows. The results are identical to single-process masking. |
+| DB readiness (`recommend`) | Checks the recovery model (recommends SIMPLE on the masking copy), **Accelerated Database Recovery** (recommended ON for SQL 2019/2022), free log space against the largest single-transaction table, and free tempdb space. |
+
+Recommended setup on the masking copy before a large run:
+
+```sql
+ALTER DATABASE CURRENT SET RECOVERY SIMPLE;
+ALTER DATABASE CURRENT SET ACCELERATED_DATABASE_RECOVERY = ON;
+-- pre-grow the log if 'recommend' says the largest single-transaction table needs more than is free
+```
+
+Measured in testing: 300k rows / 107 MB, with 2 masked columns and 350k distinct values, took
+35 s with 4 workers.
+
+## 7. How the update works
+
+1. Distinct values (or distinct (person, date) pairs) are read, grouped by
+   `HASHBYTES('SHA2_256', …)`.
+2. Each one is masked, validated against the column and the `output_type`, and collision-checked.
+   The results go into the session temp table `#deid_map` as (column, hash, masked).
+   **Original values are never stored anywhere.**
+3. A set-based `UPDATE … LEFT JOIN #deid_map` runs per batch or as a single statement. FKs touching
+   masked columns are set to `NOCHECK` and re-validated `WITH CHECK` at the end, and triggers are
+   disabled and then re-enabled.
+4. Safety checks:
+   * `dry-run` writes nothing.
+   * A run that has committed any data (status `PARTIAL`/`SUCCEEDED`) blocks a fresh run on the
+     same database, because double masking would break consistency. Use `--resume <run_id>`.
+   * ON UPDATE CASCADE FKs and IDENTITY/computed columns are rejected.
 
 ---
 
-## 2. Step-by-step instructions
+## 8. Step-by-step instructions
 
-### Step 1: Install the prerequisites (one time)
+### Step 1: Prerequisites (one time per machine)
+1. **ODBC Driver 18 for SQL Server** from Microsoft.
+2. **ActiveState State Tool**. Windows PowerShell:
+   `powershell -Command "& $([scriptblock]::Create((New-Object Net.WebClient).DownloadString('https://platform.activestate.com/dl/cli/install.ps1')))"`.
+   Linux: `sh <(curl -q https://platform.activestate.com/dl/cli/install.sh)`. Then run `state auth`.
+   These commands change between releases; check `state --help` if one fails.
 
-1. **Microsoft ODBC Driver 18 for SQL Server** (or 17). On Windows, download it from Microsoft
-   ("Download ODBC Driver for SQL Server"). Check that it's installed:
-   `Get-OdbcDriver -Name "*SQL Server*"` (PowerShell).
-2. **ActiveState State Tool**
-   * Windows (PowerShell):
-     `powershell -Command "& $([scriptblock]::Create((New-Object Net.WebClient).DownloadString('https://platform.activestate.com/dl/cli/install.ps1')))"`
-   * Linux/macOS: `sh <(curl -q https://platform.activestate.com/dl/cli/install.sh)`
-   * Then open a new terminal and run `state auth` to log in.
-   * These commands change between State Tool releases; check `state --help` if one fails.
-
-### Step 2: Create the ActiveState Python runtime for this project
-
+### Step 2: ActiveState runtime
 ```bat
 cd C:\work\Pythondeid
 state init <your-org>/pythondeid --language python@3.11
-state install pyodbc
-state install pyyaml
-state install pytest
-:: or, in one go:  state import requirements.txt
-state shell
+state import requirements.txt          :: pyodbc, pyyaml, pytest
+state shell                            :: older State Tool versions: state activate
+python -c "import pyodbc, yaml; print('ok')"
 ```
 
-`state shell` (named `state activate` in older releases) opens a shell that uses the project's
-ActiveState Python. Check it with `python -c "import pyodbc, yaml; print('ok')"`.
-
-Optional: append this to the generated `activestate.yaml` so you can run `state run deid <command>`:
-
+Optional `activestate.yaml` script, so you can run `state run deid <command>`:
 ```yaml
 scripts:
   - name: deid
     language: python3
-    description: pythondeid CLI
     value: |
       import runpy, sys
       sys.argv = ["main.py"] + sys.argv[1:]
       runpy.run_path("main.py", run_name="__main__")
 ```
 
-### Step 3: Create the masking secret (one time per organisation)
-
+### Step 3: One secret key for all servers
 ```bat
-python main.py genkey
-setx DEID_SECRET_KEY "<the key printed above>"
+python main.py genkey                  :: once, for the whole organisation; store in your vault
+setx DEID_SECRET_KEY "<key>"           :: on every server / machine that masks
+python main.py key-fingerprint         :: put the fingerprint in settings.yaml -> security.expected_key_fingerprint
 ```
 
-Store the key in your vault. **Use the same key for every run and every database** that has to
-stay consistent. If the key is lost, masks can't be reproduced. If it leaks, someone could test
-guesses against the masks. Audit records keep only a non-reversible key fingerprint.
-
-### Step 4: Configure the connection (answers questions)
-
+### Step 4: Connection (asks questions)
 ```bat
 python main.py configure
 python main.py test-connection
 ```
+The password goes in the `DEID_DB_PASSWORD` environment variable, never in a file.
+`db_owner` on the masking copy is simplest. Demo database:
+`sqlcmd -S localhost -E -I -i sql\sample_schema.sql`.
 
-This writes `config/settings.yaml`. Windows authentication is the default. For SQL
-authentication, put the password in an environment variable (`set DEID_DB_PASSWORD=...`). It is
-never stored in a file.
+### Step 5: Table structure and columns
+Choose one:
+* `python main.py wizard`. For each column it asks whether to mask it, the type and domain,
+  **full or last 4**, **number vs. text storage** (normalisation), **per-person dates and the
+  person-id column**, **free-text handling**, and the expected output type. It records the live
+  type as `expected_input_type`.
+* Spreadsheet: `python main.py discover`, fill `mask_type`/`domain`/`params_json`/`output_type`/
+  `entity_column` in Excel, then `python main.py import-csv config\discovered_schema.csv`.
+* Edit `config/deid_rules.yaml` directly; the sample is commented.
 
-The login needs permission to `SELECT`/`UPDATE` the target tables and `ALTER` them (to toggle
-FKs and triggers). It also needs `CREATE SCHEMA`/`CREATE TABLE` for the audit schema; `db_owner`
-on the masking copy is simplest.
-
-*Optional demo database:* `sqlcmd -S localhost -E -I -i sql\sample_schema.sql`
-
-### Step 5: Supply the table structure and choose the columns
-
-Pick one of these:
-
-* **A. Interactive wizard (asks questions):** `python main.py wizard`. It lists the schemas and
-  tables, shows each table's columns with types, PK flags and a suggested mask type. For each
-  column it asks whether to mask it, which type to use, which domain, and any parameters. It then
-  writes `config/deid_rules.yaml`.
-* **B. Spreadsheet:**
-  ```bat
-  python main.py discover --out config\discovered_schema.csv
-  :: open in Excel: fill mask_type (and domain / params_json where needed), save as CSV
-  python main.py import-csv config\discovered_schema.csv
-  ```
-* **C. Edit `config/deid_rules.yaml` directly.** It is commented and lists the mask types
-  (`python main.py list-types`).
-
-Rule of thumb: **columns that join to each other must use the same domain name.**
-
-### Step 6: Preview the algorithms (no database needed)
-
+### Step 6: Recommendations (types, formats, batch sizes, DB readiness)
 ```bat
-python main.py preview --domain ssn 123-45-6789 123456789
-python main.py preview --type email John.Doe@Mail.com john.doe@mail.com
-python main.py preview --type account_number --params "{\"preserve_last\": 4}" ACC-0001234567
+python main.py recommend --out recommendations.csv
+```
+Apply the advice: add `normalize/pad_to`, widen or set `output_type`, switch the copy to SIMPLE
+recovery, enable ADR, pre-grow the log.
+
+### Step 7: Validate and dry run
+```bat
+python main.py validate                :: schema, FK domains, types, strategy, batch sizes
+python main.py dry-run                 :: masks and checks every value, writes nothing
+python main.py preview --domain ssn 123-45-6789           :: spot-check algorithms offline
+python main.py preview --domain person_dates --entity 42 1980-04-12
 ```
 
-### Step 7: Validate the plan against the live schema
-
+### Step 8: Run on a backed-up, non-production copy
 ```bat
-python main.py validate
+python main.py run                     :: confirmations: backup, passing dry-run, type DB name
+python main.py run --resume <run_id>   :: after fixing a PARTIAL run
 ```
 
-This shows every table, column, domain, update strategy and affected FK. It reports errors such
-as missing columns, an FK whose partner column isn't masked, a domain mismatch, a non-unique
-masker on a key, or IDENTITY/computed columns.
-
-### Step 8: Dry run (changes nothing)
-
+### Step 9: Other databases and servers
+On each additional server: use the same key, `settings.yaml` (with the pinned fingerprint) and
+`deid_rules.yaml`, then:
 ```bat
+python main.py test-vectors --check config\test_vectors.csv   :: proves identical masking here
+python main.py validate                                        :: expected_input_type catches schema drift
 python main.py dry-run
+python main.py run
 ```
+Create `config/test_vectors.csv` once on the first server with `python main.py test-vectors`.
 
-This masks every distinct value in memory and validates it against the target column. Results go
-to `audit/<run_id>/`. Fix anything it reports, for example an email token that's too long for a
-`varchar(20)`: lower `token_length` or use a shorter `domain`.
-
-### Step 9: Back up, then run
-
-1. **Run this only on a restored non-production copy**, and take a backup first.
-2. Optionally record integrity counts first (see the query at the end of `sql/sample_schema.sql`).
-3. Run:
-   ```bat
-   python main.py run
-   ```
-   It asks you to confirm it's a non-production copy with a backup, checks that a passing dry-run
-   exists, and asks you to type the database name. Use `-y` for unattended runs.
-4. If it stops partway (`PARTIAL`): fix the cause, then run `python main.py run --resume <run_id>`.
-   Completed tables are skipped and chunked tables continue from their checkpoint. FKs stay
-   disabled until every table is done.
-
-### Step 10: Verify and review the audit
-
+### Step 10: Audit and verification
 ```bat
 python main.py audit-report
 python main.py audit-report --run-id <run_id>
 ```
-
 ```sql
-SELECT * FROM deid_audit.run ORDER BY started_at DESC;
-SELECT * FROM deid_audit.column_result WHERE run_id = '<run_id>';
-SELECT * FROM deid_audit.event WHERE run_id = '<run_id>' ORDER BY id;
+SELECT * FROM deid_audit.run ORDER BY started_at DESC;          -- key fingerprint, algorithm version, status
+SELECT * FROM deid_audit.column_result WHERE run_id = '<run_id>'; -- per column: rows, distinct before/after, batch size
+SELECT * FROM deid_audit.event WHERE run_id = '<run_id>' ORDER BY id;  -- FK/index/trigger actions, warnings
 ```
-
-The integrity join counts should match the pre-masking counts. For bijective types,
-`distinct_before` should equal `distinct_after`.
+Re-run the integrity query at the end of `sql/sample_schema.sql` (or your own) and compare it with
+the counts from before masking.
 
 ---
 
-## 3. Project layout
+## 9. Project layout
 
 ```
-main.py                    CLI (genkey, configure, test-connection, discover, import-csv, wizard,
-                           validate, dry-run, run, audit-report, preview, list-types)
-config/settings.yaml       connection / execution / audit / logging (no secrets)
-config/deid_rules.yaml     domains + tables/columns to mask
+main.py                    CLI: genkey, key-fingerprint, configure, test-connection, discover, import-csv,
+                           wizard, recommend, validate, dry-run, run, audit-report, preview, list-types,
+                           test-vectors
+config/settings.yaml       connection, security (key fingerprint), execution, batching, audit, logging
+config/deid_rules.yaml     algorithm_version, domains, tables/columns (+ type/format/entity options)
 deid/config.py             YAML/CSV loading and validation
-deid/db.py                 pyodbc connection factory, identifier quoting, retry helper
-deid/schema.py             catalog introspection: columns, PKs, unique indexes, FKs, triggers
+deid/maskers.py            masking algorithms, key derivation, free-text scrubber, registry
 deid/fpe.py                Feistel format-preserving encryption
-deid/maskers.py            masking algorithms + key derivation + registry
-deid/engine.py             planner (integrity checks, strategy) + executor
+deid/engine.py             planner (integrity, types, strategy, batch size) + executor
+deid/advisor.py            type guide, batch sizing, DB readiness, column profiling
+deid/parallel.py           multi-process masking
+deid/schema.py             catalog: columns, keys, unique indexes, FKs, sizes, type parsing
 deid/audit.py              DB + file audit trail, checkpoints
-deid/discovery.py          PII column heuristics, CSV export, interactive wizard
-deid/prompts.py            console question helpers
-deid/logging_setup.py      console + rotating file logs (logs/deid.log)
-sql/sample_schema.sql      demo database with cross-table PII
-tests/                     unit tests + opt-in live SQL Server test
+deid/db.py                 pyodbc connections, quoting, retries
+deid/discovery.py          PII heuristics, CSV export, interactive wizard
+deid/prompts.py            console questions
+sql/sample_schema.sql      demo DB: cross-table PII, bigint/varchar ids, visits with notes
+tests/                     unit tests + opt-in live SQL Server tests (DEID_IT_SERVER)
 ```
 
-Adding a mask type: subclass `BaseMasker` in `deid/maskers.py`, set `type_name`,
-`default_params`, `families` and `injective`, implement `_mask`, and add it to `MASKERS`.
-
-## 4. Tests
+## 10. Tests
 
 ```bat
 python -m pytest -q
+set DEID_IT_SERVER=localhost & set DEID_IT_PASSWORD=... & python -m pytest -q   :: + live end-to-end tests
 ```
 
-The end-to-end test runs against a real SQL Server and is skipped unless `DEID_IT_SERVER` is set.
-See `tests/test_integration_sqlserver.py`; a Docker `mssql/server:2022` container works.
+The live tests mask the demo database and check that all integrity counts (joins, member-number
+matches across bigint/varchar, stay lengths, ages) are unchanged. They also mask **two independent
+databases** and assert that every masked value is identical.
 
-## 5. Limitations
+## 11. Limitations
 
-* Requires SQL Server 2016 or later (`HASHBYTES` over `NVARCHAR(MAX)`). Values that mask to more
-  than 4000 characters aren't supported.
-* Consistency depends on the value's text form. `'00123'` in a varchar and `123` in an int are
-  different inputs; `ssn` pads integers to 9 digits to handle the common case.
-* `date_shift` shifts each distinct date on its own, so intervals between two dates of the same
-  person aren't preserved. Use `generalize: year` if that matters.
-* Free-text columns (notes, comments) can contain embedded PII. Use `redact`/`nullify` for them;
-  masking can't find PII inside prose.
-* `float`/`real`, binary, XML and spatial columns support `nullify` only.
-* Single-strategy tables are updated in one transaction, so size the transaction log (or use
-  SIMPLE recovery on the copy).
+* Requires SQL Server 2016 or later (built and tested on 2022). Masked values over 4000
+  characters aren't supported.
+* Changing a domain's name, type or identity parameters (e.g. `mode`) changes its masks. Keep the
+  rules file under version control and identical on every server.
+* Regex free-text scrubbing doesn't detect names or other PII written in prose.
+* A masked primary key (or a masked column in a clustered/FK-referenced unique index) forces a
+  single-transaction update for that table. Size the log accordingly; `recommend` estimates it.
