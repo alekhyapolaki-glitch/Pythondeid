@@ -10,7 +10,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import yaml
+try:
+    import yaml
+except ImportError:  # PyYAML-ft (free-threading build, e.g. some ActiveState runtimes) installs as yaml_ft
+    import yaml_ft as yaml
 
 from .maskers import ALGORITHM_VERSION, MaskerError, get_masker_class
 
