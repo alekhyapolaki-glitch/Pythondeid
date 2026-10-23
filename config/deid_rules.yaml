@@ -45,7 +45,10 @@ domains:
 
   account_name:             # people -> fake person names; businesses -> fake company names keeping INC/LLC/...
     type: account_name
-    params: {keep_industry_words: true, extra_business_words: []}
+    params:
+      method: realistic     # realistic (fake names) | hash (unique code) | redact (constant)
+      keep_industry_words: true
+      extra_business_words: []
 
   phone: {type: phone}
   first_name: {type: first_name}

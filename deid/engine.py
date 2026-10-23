@@ -146,6 +146,9 @@ class Plan:
                     extra.append("per-person shift by %s" % cp.entity_info.name)
                 if cp.output_info is not None:
                     extra.append("output_type %s" % cp.output_info.type_display())
+                for k in ("method", "mode"):
+                    if k in cp.domain.params:
+                        extra.append("%s=%s" % (k, cp.domain.params[k]))
                 if cp.overrides:
                     extra.append(", ".join("%s=%s" % kv for kv in cp.overrides.items()))
                 lines.append("      - %-30s %-16s -> domain '%s' (%s)%s" % (

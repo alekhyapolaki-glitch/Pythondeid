@@ -173,6 +173,10 @@ def _ask_key_questions(mtype: str, col: ColumnInfo, domains: Dict[str, DomainRul
             col.family in ("int", "decimal")):
         p["normalize"] = "digits"
         p["pad_to"] = prompts.ask_int("    Maximum number of digits the identifier can have", 12, 1)
+    if mtype in ("full_name", "account_name"):
+        print("    realistic = fake names (businesses keep INC/LLC/industry words) | hash = unique code | "
+              "redact = constant")
+        p["method"] = prompts.choose("    How should names be masked?", ["realistic", "hash", "redact"], "realistic")
     if mtype == "date_shift":
         if prompts.ask_yes_no("    Shift all dates of the same person by the same offset (keeps intervals)?", True):
             p["shift_by"] = "entity"

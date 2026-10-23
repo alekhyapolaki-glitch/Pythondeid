@@ -259,3 +259,23 @@ def test_account_name_options(keyring):
     assert m.mask("1 FAITH HOLDINGS LLC").startswith("1 ")
     with pytest.raises(MaskerError):
         create_masker("account_name", "n", keyring, {"extra_business_words": "LABS"})
+
+
+def test_name_methods_pick_existing_algorithms(keyring):
+    for mtype in ("full_name", "account_name"):
+        h = create_masker(mtype, "names", keyring, {"method": "hash", "hash_prefix": "N-", "hash_length": 12})
+        expected = create_masker("hash", "names", keyring, {"length": 12, "prefix": "N-", "case_sensitive": False})
+        assert h.mask("ACME DEVELOPMENT INC") == expected.mask("ACME DEVELOPMENT INC")
+        assert h.mask("John Smith") == h.mask("JOHN SMITH ") and h.injective
+        r = create_masker(mtype, "names", keyring, {"method": "redact", "redact_value": "XXX"})
+        assert r.mask("John Smith") == "XXX" and r.mask(None) is None
+        assert create_masker(mtype, "names", keyring).mask("JOHN A SMITH") != "JOHN A SMITH"
+        with pytest.raises(MaskerError):
+            create_masker(mtype, "names", keyring, {"method": "scramble"})
+
+
+def test_name_method_hash_allowed_on_unique_column():
+    from deid.maskers import is_injective
+    assert is_injective("account_name", {"method": "hash"})
+    assert not is_injective("account_name", {"method": "realistic"})
+    assert not is_injective("full_name", {})

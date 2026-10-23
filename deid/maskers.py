@@ -492,9 +492,41 @@ class LastNameMasker(FirstNameMasker):
         return _match_case(value.strip(), self._pick(data.LAST_NAMES, "last", self.canonical(value)))
 
 
+# Name columns choose their algorithm with one setting; each method delegates to an existing masker.
+#   realistic - fake names (this class / account_name logic)
+#   hash      - HashMasker token, case-insensitive (unique; usable on key/unique columns)
+#   redact    - RedactMasker constant
+NAME_METHODS = ("realistic", "hash", "redact")
+NAME_METHOD_PARAMS = {"method": "realistic", "hash_length": 16, "hash_prefix": "", "redact_value": "REDACTED"}
+
+
 class FullNameMasker(FirstNameMasker):
     type_name = "full_name"
-    description = "Replace 'First [Middle] Last' / 'Last, First' token by token (consistent with name parts)"
+    description = ("Person names: method=realistic (fake 'First M. Last', default) | hash (unique token) | "
+                   "redact (constant)")
+    default_params = dict(NAME_METHOD_PARAMS)
+
+    @classmethod
+    def _check_params(cls, p):
+        _choice(p, "method", NAME_METHODS)
+        if not isinstance(p["hash_length"], int) or not 8 <= p["hash_length"] <= 64:
+            raise MaskerError("hash_length must be an integer between 8 and 64")
+
+    def _setup(self):
+        method = self.params["method"]
+        self._delegate: Optional[BaseMasker] = None
+        if method == "hash":
+            self._delegate = HashMasker(self.domain, self._key, {
+                "length": self.params["hash_length"], "prefix": self.params["hash_prefix"], "case_sensitive": False})
+            self.injective = True
+            self.collision_check = True
+        elif method == "redact":
+            self._delegate = RedactMasker(self.domain, self._key, {"value": self.params["redact_value"]})
+
+    def mask(self, value, entity=None):
+        if self._delegate is not None:
+            return self._delegate.mask(value)
+        return super().mask(value, entity)
 
     def _mask(self, value):
         text = value.strip()
@@ -549,16 +581,18 @@ class AccountNameMasker(FullNameMasker):
     """
 
     type_name = "account_name"
-    description = ("Account/customer names that may be people or businesses: people -> fake person names, "
-                   "businesses -> fake company names keeping INC/LLC/LTD and industry words")
-    default_params = {"keep_industry_words": True, "extra_business_words": [], "keep_numbers": False}
+    description = ("Account/customer names (people or businesses): method=realistic -> fake person names / fake "
+                   "company names keeping INC/LLC/LTD and industry words; method=hash | redact")
+    default_params = dict(NAME_METHOD_PARAMS, keep_industry_words=True, extra_business_words=[], keep_numbers=False)
 
     @classmethod
     def _check_params(cls, p):
+        super()._check_params(p)
         if not isinstance(p["extra_business_words"], list):
             raise MaskerError("account_name.extra_business_words must be a list of words, e.g. [BANCSHARES, LABS]")
 
     def _setup(self):
+        super()._setup()
         self._generic = (data.BUSINESS_SUFFIXES | data.INDUSTRY_WORDS
                          | {str(w).upper().rstrip(".") for w in self.params["extra_business_words"]})
         self._first_set = {n.upper() for n in data.FIRST_NAMES}
@@ -939,6 +973,8 @@ def is_injective(type_name: str, params: Optional[Dict[str, Any]] = None) -> boo
     cls = get_masker_class(type_name)
     if cls is ZipMasker:
         return (params or {}).get("mode", "truncate") == "fpe"
+    if issubclass(cls, FullNameMasker):
+        return (params or {}).get("method", "realistic") == "hash"
     return cls.injective
 
 
