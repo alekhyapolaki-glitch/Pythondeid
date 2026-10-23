@@ -17,6 +17,23 @@ keep working after masking. It is built for SQL Server 2022 and large tables.
 | Big tables | `batch_size: auto` sized per table, parallel masking workers, unique-index handling, DB readiness checks |
 | Update SQL Server, ask questions, audit | `run` with confirmations, `configure`/`wizard`, `deid_audit.*` tables + `audit/<run_id>/` files |
 
+## Configuration files
+
+| File | Holds | Shared between servers? | In Git? |
+|---|---|---|---|
+| `config/connections.yaml` | **Database connections**: several named ones (`dev`, `uat`, …), one `default` | No, one per machine | No (template: `connections.example.yaml`) |
+| `config/paths.yaml` | **File/folder locations**: rules file, audit folder, logs, discovery/test-vector CSVs | Usually the same | Yes |
+| `config/settings.yaml` | **How it runs**: batching, workers, key fingerprint, audit options, log level | Yes | Yes |
+| `config/deid_rules.yaml` | **What to mask**: policy, domains, tables | Yes, must be identical | Yes |
+
+* Secrets are in **no** file: the masking key is `DEID_SECRET_KEY`, and SQL passwords go in the
+  variable named by each connection's `password_env`.
+* `python main.py configure` adds or updates a connection, the run settings and the policy.
+  `python main.py connections` lists connections.
+* Pick a connection per command: `python main.py -c uat validate`. Without `-c`, the default is used.
+* Relative paths in `paths.yaml` are relative to the project folder, so commands work from any
+  directory.
+
 ---
 
 ## 1. Consistency across tables, databases and servers
@@ -242,8 +259,10 @@ python main.py key-fingerprint         :: put the fingerprint in settings.yaml -
 
 ### Step 4: Connection and masking policy (asks questions)
 ```bat
-python main.py configure               :: connection questions + policy (full/last4, name method)
+python main.py configure               :: connection -> connections.yaml, run settings -> settings.yaml, policy
 python main.py test-connection
+python main.py connections             :: list connections (* = default)
+python main.py -c uat test-connection  :: use another named connection
 python main.py policy                  :: change only the policy later
 ```
 The password goes in the `DEID_DB_PASSWORD` environment variable, never in a file.
@@ -313,7 +332,9 @@ the counts from before masking.
 main.py                    CLI: genkey, key-fingerprint, configure, test-connection, discover, import-csv,
                            wizard, recommend, validate, dry-run, run, audit-report, preview, list-types,
                            test-vectors
-config/settings.yaml       connection, security (key fingerprint), execution, batching, audit, logging
+config/connections.yaml    database connections for this machine (not in Git; see connections.example.yaml)
+config/paths.yaml          file and folder locations (rules file, audit, logs, CSVs)
+config/settings.yaml       security (key fingerprint), execution, batching, audit, logging level
 config/deid_rules.yaml     algorithm_version, domains, tables/columns (+ type/format/entity options)
 deid/config.py             YAML/CSV loading and validation
 deid/maskers.py            masking algorithms, key derivation, free-text scrubber, registry

@@ -1,0 +1,9 @@
+# File and folder locations used by pythondeid.
+# Relative paths are relative to the project folder (where main.py is), so the tool works from any directory.
+# Absolute paths (e.g. D:\deid\audit) and environment variables (%USERPROFILE%) are allowed.
+rules_file: config/deid_rules.yaml            # what to mask (shared with every server)
+audit_dir: audit                              # audit/<run_id>/summary.json, column_results.csv, events.jsonl
+log_dir: logs                                 # deid.log (rotating)
+discovery_csv: config/discovered_schema.csv   # output of: python main.py discover
+test_vectors: config/test_vectors.csv         # output of: python main.py test-vectors
+recommendations_csv: config/recommendations.csv

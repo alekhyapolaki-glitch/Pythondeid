@@ -12,3 +12,6 @@ config/discovered_schema.csv
 # never commit secrets
 .env
 *.key
+# database connections are per machine (server names); template: config/connections.example.yaml
+config/connections.yaml
+config/recommendations.csv

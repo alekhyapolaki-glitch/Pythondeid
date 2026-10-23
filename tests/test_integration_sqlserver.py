@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from deid.config import DEFAULT_SETTINGS, Settings, _deep_merge, load_rules
+from deid.config import DEFAULT_SETTINGS, Settings, _deep_merge, load_rules, validate_connection
 from deid.db import ConnectionFactory
 from deid.engine import Engine
 from deid.maskers import KeyRing
@@ -36,12 +36,13 @@ KEY = "integration-test-key-0123456789abcdefghijklmnop"
 
 
 def _settings(tmp_path, database):
+    db = validate_connection({
+        "server": os.environ["DEID_IT_SERVER"], "database": database, "auth": "sql",
+        "username": os.environ.get("DEID_IT_USER", "sa"), "password_env": "DEID_IT_PASSWORD",
+        "trust_server_certificate": True,
+    }, "integration test")
     raw = _deep_merge(DEFAULT_SETTINGS, {
-        "database": {
-            "server": os.environ["DEID_IT_SERVER"], "database": database, "auth": "sql",
-            "username": os.environ.get("DEID_IT_USER", "sa"), "password_env": "DEID_IT_PASSWORD",
-            "trust_server_certificate": True,
-        },
+        "database": db,
         "execution": {"batch_size": 2},
         "audit": {"output_dir": str(tmp_path / "audit")},
         "logging": {"dir": str(tmp_path / "logs")},

@@ -1,23 +1,10 @@
 # ---------------------------------------------------------------------------
-# pythondeid environment settings.  NO secrets in this file:
-#   * DB password      -> environment variable named by database.password_env
-#   * masking key      -> environment variable named by security.secret_key_env
-# Re-create interactively with:  python main.py configure
+# pythondeid run settings: HOW the tool runs.  Other config files:
+#   config/connections.yaml - database connections (this machine only; python main.py configure)
+#   config/paths.yaml       - file and folder locations (rules file, audit, logs, CSVs)
+#   config/deid_rules.yaml  - WHAT to mask and how (policy, domains, tables)
+# NO secrets anywhere: the masking key and DB passwords live in environment variables.
 # ---------------------------------------------------------------------------
-database:
-  driver: ODBC Driver 18 for SQL Server     # or "ODBC Driver 17 for SQL Server"
-  server: localhost                          # host, host,port  or  host\INSTANCE
-  database: DeidDemo
-  auth: windows                              # windows | sql | azure_ad_interactive | azure_ad_password
-  username: ''                               # required for sql / azure_ad_* auth
-  password_env: DEID_DB_PASSWORD
-  encrypt: true
-  trust_server_certificate: true             # set false when the server has a trusted certificate
-  login_timeout: 30
-  query_timeout: 0                           # seconds, 0 = no limit
-  application_name: pythondeid
-  extra: {}                                  # any extra ODBC keywords, e.g. {MultiSubnetFailover: 'yes'}
-
 security:
   secret_key_env: DEID_SECRET_KEY            # SAME key on every server => same masks across tables/DBs/servers
   min_key_length: 32
@@ -45,9 +32,8 @@ batching:                          # used when execution.batch_size = auto
 
 audit:
   write_to_db: true                # audit tables in the schema below (also needed for resumable chunks)
+                                   # local audit files go to audit_dir in paths.yaml
   schema: deid_audit
-  output_dir: audit                # local copy: audit/<run_id>/summary.json, column_results.csv, events.jsonl
 
 logging:
-  level: INFO
-  dir: logs
+  level: INFO                      # log files go to log_dir in paths.yaml

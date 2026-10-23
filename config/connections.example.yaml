@@ -1,0 +1,27 @@
+# Database connections for THIS machine.  Copy to connections.yaml, or let
+# "python main.py configure" create it.  connections.yaml is not committed to Git.
+#
+# No passwords here: Windows authentication uses your login; for SQL logins put
+# the password in the environment variable named by password_env.
+#
+# Pick a connection per command with --connection NAME (or -c NAME); otherwise "default" is used.
+default: dev
+
+connections:
+  dev:
+    server: SQLSERVER01\INSTANCE        # as shown in SSMS Object Explorer (host, host,port or host\instance)
+    database: MyDb_MaskingCopy          # always a NON-production copy
+    auth: windows                       # windows | sql | azure_ad_interactive | azure_ad_password
+    driver: ODBC Driver 18 for SQL Server
+    encrypt: true
+    trust_server_certificate: true      # usual for internal servers with company certificates
+
+  uat:
+    server: SQLSERVER02
+    database: MyDb_UAT_Copy
+    auth: sql
+    username: deid_svc
+    password_env: DEID_UAT_PASSWORD     # set with: setx DEID_UAT_PASSWORD "..."
+    driver: ODBC Driver 18 for SQL Server
+    encrypt: true
+    trust_server_certificate: true

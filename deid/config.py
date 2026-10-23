@@ -6,6 +6,7 @@ import copy
 import csv
 import hashlib
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -25,21 +26,42 @@ class ConfigError(Exception):
 # =============================================================================
 # settings.yaml
 # =============================================================================
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+# ---------------------------------------------------------------------------
+# connections.yaml - database connections only (one file per machine, not in Git)
+# ---------------------------------------------------------------------------
+DEFAULT_CONNECTION: Dict[str, Any] = {
+    "driver": "ODBC Driver 18 for SQL Server",
+    "server": "localhost",
+    "database": "",
+    "auth": "windows",  # windows | sql | azure_ad_interactive | azure_ad_password
+    "username": "",
+    "password_env": "DEID_DB_PASSWORD",
+    "encrypt": True,
+    "trust_server_certificate": False,
+    "login_timeout": 30,
+    "query_timeout": 0,
+    "application_name": "pythondeid",
+    "extra": {},
+}
+
+# ---------------------------------------------------------------------------
+# paths.yaml - file and folder locations (relative paths are relative to the project folder)
+# ---------------------------------------------------------------------------
+DEFAULT_PATHS: Dict[str, str] = {
+    "rules_file": "config/deid_rules.yaml",
+    "audit_dir": "audit",
+    "log_dir": "logs",
+    "discovery_csv": "config/discovered_schema.csv",
+    "test_vectors": "config/test_vectors.csv",
+    "recommendations_csv": "config/recommendations.csv",
+}
+
+# ---------------------------------------------------------------------------
+# settings.yaml - how the tool runs (no connections, no file locations)
+# ---------------------------------------------------------------------------
 DEFAULT_SETTINGS: Dict[str, Any] = {
-    "database": {
-        "driver": "ODBC Driver 18 for SQL Server",
-        "server": "localhost",
-        "database": "",
-        "auth": "windows",  # windows | sql | azure_ad_interactive | azure_ad_password
-        "username": "",
-        "password_env": "DEID_DB_PASSWORD",
-        "encrypt": True,
-        "trust_server_certificate": False,
-        "login_timeout": 30,
-        "query_timeout": 0,
-        "application_name": "pythondeid",
-        "extra": {},
-    },
     "security": {"secret_key_env": "DEID_SECRET_KEY", "min_key_length": 32, "expected_key_fingerprint": ""},
     "execution": {
         "batch_size": "auto",            # rows per chunk, or "auto" = sized per table (see batching below)
@@ -61,11 +83,12 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "min_batch_size": 10000,
         "max_batch_size": 500000,
     },
-    "audit": {"write_to_db": True, "schema": "deid_audit", "output_dir": "audit"},
-    "logging": {"level": "INFO", "dir": "logs"},
+    "audit": {"write_to_db": True, "schema": "deid_audit"},
+    "logging": {"level": "INFO"},
 }
 
-_SECTIONS = ("database", "security", "execution", "batching", "audit", "logging")
+_SECTIONS = ("security", "execution", "batching", "audit", "logging")
+_LEGACY_SECTIONS = ("database",)  # older settings.yaml kept the connection here; still accepted
 
 _AUTH_MODES = ("windows", "sql", "azure_ad_interactive", "azure_ad_password")
 
@@ -79,9 +102,15 @@ class Settings:
     audit: Dict[str, Any]
     logging: Dict[str, Any]
     source_path: Optional[Path] = None
+    paths: Dict[str, str] = field(default_factory=dict)
+    connection_name: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
-        return {k: copy.deepcopy(getattr(self, k)) for k in _SECTIONS}
+        """settings.yaml content: behaviour only (connections and paths live in their own files)."""
+        out = {k: copy.deepcopy(getattr(self, k)) for k in _SECTIONS}
+        out["audit"].pop("output_dir", None)
+        out["logging"].pop("dir", None)
+        return out
 
 
 def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
@@ -107,23 +136,103 @@ def _read_yaml(path: Path) -> Dict[str, Any]:
     return data
 
 
-def load_settings(path: str) -> Settings:
+def _resolve(path_value: str) -> str:
+    p = Path(os.path.expandvars(str(path_value)))
+    return str(p if p.is_absolute() else PROJECT_ROOT / p)
+
+
+def load_paths(path: Optional[str] = None) -> Dict[str, str]:
+    """File/folder locations from paths.yaml (defaults when the file is absent), as absolute paths."""
+    raw: Dict[str, Any] = {}
+    if path and Path(path).exists():
+        raw = _read_yaml(Path(path))
+        unknown = set(raw) - set(DEFAULT_PATHS)
+        if unknown:
+            raise ConfigError("Unknown key(s) in %s: %s. Allowed: %s" % (path, sorted(unknown), sorted(DEFAULT_PATHS)))
+    merged = dict(DEFAULT_PATHS, **{k: str(v) for k, v in raw.items() if v})
+    return {k: _resolve(v) for k, v in merged.items()}
+
+
+def validate_connection(db: Dict[str, Any], where: str) -> Dict[str, Any]:
+    unknown = set(db) - set(DEFAULT_CONNECTION)
+    if "password" in db:
+        raise ConfigError("%s: do not store passwords in config files. Put it in the environment variable named by "
+                          "password_env (default DEID_DB_PASSWORD)." % where)
+    if unknown:
+        raise ConfigError("%s: unknown key(s) %s. Allowed: %s" % (where, sorted(unknown), sorted(DEFAULT_CONNECTION)))
+    merged = _deep_merge(DEFAULT_CONNECTION, db)
+    if merged["auth"] not in _AUTH_MODES:
+        raise ConfigError("%s: auth must be one of %s" % (where, ", ".join(_AUTH_MODES)))
+    if merged["auth"] in ("sql", "azure_ad_password", "azure_ad_interactive") and not merged["username"]:
+        raise ConfigError("%s: username is required for auth=%s" % (where, merged["auth"]))
+    return merged
+
+
+def load_connections(path: str) -> Tuple[str, Dict[str, Dict[str, Any]]]:
+    """Returns (default name, {name: connection}) from connections.yaml."""
+    raw = _read_yaml(Path(path))
+    conns = raw.get("connections") or {}
+    if not isinstance(conns, dict):
+        raise ConfigError("%s: 'connections' must be a mapping of name -> connection settings" % path)
+    unknown = set(raw) - {"default", "connections"}
+    if unknown:
+        raise ConfigError("Unknown key(s) in %s: %s (expected 'default' and 'connections')" % (path, sorted(unknown)))
+    out = {str(n): validate_connection(c or {}, "%s connection '%s'" % (path, n)) for n, c in conns.items()}
+    default = str(raw.get("default") or (next(iter(out)) if out else ""))
+    if out and default not in out:
+        raise ConfigError("%s: default connection '%s' is not defined" % (path, default))
+    return default, out
+
+
+def save_connection(path: str, name: str, db: Dict[str, Any], make_default: bool) -> None:
     p = Path(path)
-    raw = _read_yaml(p)
-    unknown = set(raw) - set(DEFAULT_SETTINGS)
+    raw = _read_yaml(p) if p.exists() else {}
+    conns = raw.get("connections") or {}
+    conns[name] = {k: v for k, v in db.items() if k in DEFAULT_CONNECTION}
+    default = name if (make_default or not raw.get("default")) else raw["default"]
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("w", encoding="utf-8") as fh:
+        fh.write("# Database connections for this machine (no passwords: use the password_env variable).\n"
+                 "# Pick one with --connection NAME; otherwise 'default' is used. Not committed to Git.\n")
+        yaml.safe_dump({"default": default, "connections": conns}, fh, sort_keys=False, default_flow_style=False)
+
+
+def load_settings(path: str, connections_path: Optional[str] = None, connection: Optional[str] = None,
+                  paths_path: Optional[str] = None) -> Settings:
+    p = Path(path)
+    raw = _read_yaml(p) if p.exists() else {}
+    unknown = set(raw) - set(DEFAULT_SETTINGS) - set(_LEGACY_SECTIONS)
     if unknown:
         raise ConfigError("Unknown section(s) in %s: %s" % (p, sorted(unknown)))
+    legacy_db = raw.pop("database", None)
     merged = _deep_merge(DEFAULT_SETTINGS, raw)
-    db = merged["database"]
-    if db["auth"] not in _AUTH_MODES:
-        raise ConfigError("database.auth must be one of %s" % (_AUTH_MODES,))
-    if db["auth"] in ("sql", "azure_ad_password", "azure_ad_interactive") and not db["username"]:
-        raise ConfigError("database.username is required for auth=%s" % db["auth"])
-    if "password" in db:
-        raise ConfigError(
-            "Do not store passwords in settings.yaml. Put it in the environment variable named by "
-            "database.password_env (default DEID_DB_PASSWORD)."
-        )
+    paths = load_paths(paths_path)
+    # paths.yaml decides where files go; older settings.yaml values are honoured when paths.yaml is absent
+    if not (paths_path and Path(paths_path).exists()):
+        if merged["audit"].get("output_dir"):
+            paths["audit_dir"] = _resolve(merged["audit"]["output_dir"])
+        if merged["logging"].get("dir"):
+            paths["log_dir"] = _resolve(merged["logging"]["dir"])
+    merged["audit"]["output_dir"] = paths["audit_dir"]
+    merged["logging"]["dir"] = paths["log_dir"]
+
+    name = ""
+    if connections_path and Path(connections_path).exists():
+        default, conns = load_connections(connections_path)
+        name = connection or default
+        if name not in conns:
+            raise ConfigError("Connection '%s' is not in %s (available: %s). Add it with: python main.py configure"
+                              % (name, connections_path, ", ".join(conns) or "none"))
+        db = conns[name]
+    elif connection:
+        raise ConfigError("--connection %s given but %s does not exist; run: python main.py configure"
+                          % (connection, connections_path))
+    elif legacy_db is not None:
+        db = validate_connection(legacy_db, "%s database" % p)
+        name = "settings.yaml"
+    else:
+        db = dict(DEFAULT_CONNECTION)
+
     ex = merged["execution"]
     for k in ("fetch_size", "max_retries", "collision_check_max_values"):
         if not isinstance(ex[k], int) or ex[k] < (0 if k == "max_retries" else 1):
@@ -141,12 +250,13 @@ def load_settings(path: str) -> Settings:
         raise ConfigError("batching.min_batch_size must be <= max_batch_size")
     if not str(merged["audit"]["schema"]).replace("_", "").isalnum():
         raise ConfigError("audit.schema must be a simple identifier")
-    return Settings(source_path=p, **merged)
+    return Settings(database=db, source_path=p, paths=paths, connection_name=name, **merged)
 
 
 def save_settings(settings: Settings, path: str) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
+        fh.write("# How the tool runs. Connections: connections.yaml. File locations: paths.yaml.\n")
         yaml.safe_dump(settings.to_dict(), fh, sort_keys=False, default_flow_style=False)
 
 

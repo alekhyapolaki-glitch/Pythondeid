@@ -21,27 +21,38 @@ import sys
 from pathlib import Path
 
 from deid import __version__, prompts
-from deid.config import ConfigError, load_rules, load_settings, rules_from_csv, save_rules, save_settings
+from deid.config import (PROJECT_ROOT, ConfigError, load_paths, load_rules, load_settings, rules_from_csv, save_rules,
+                         save_settings)
 from deid.db import ConnectionFactory, DatabaseError, server_info
 from deid.maskers import ALGORITHM_VERSION, MASKERS, KeyRing, MaskerError, build_maskers, create_masker
 
 log = logging.getLogger("deid")
 
-DEFAULT_SETTINGS = "config/settings.yaml"
-DEFAULT_RULES = "config/deid_rules.yaml"
+# Config files (relative to the project folder, so the tool works from any current directory):
+DEFAULT_SETTINGS = str(PROJECT_ROOT / "config" / "settings.yaml")        # how it runs
+DEFAULT_CONNECTIONS = str(PROJECT_ROOT / "config" / "connections.yaml")  # database connections (this machine)
+DEFAULT_PATHS = str(PROJECT_ROOT / "config" / "paths.yaml")              # file and folder locations
+# The rules file location comes from paths.yaml (rules_file) unless --rules is given.
 
 
 # =============================================================================
 # helpers
 # =============================================================================
+def _load(args):
+    """settings.yaml + the selected connection from connections.yaml + paths.yaml."""
+    return load_settings(args.settings, args.connections, args.connection, args.paths)
+
+
 def _settings(args):
-    s = load_settings(args.settings)
+    s = _load(args)
     if getattr(args, "server", None):
         s.database["server"] = args.server
     if getattr(args, "database", None):
         s.database["database"] = args.database
     if not s.database.get("database"):
-        raise ConfigError("database.database is empty in %s (or pass --database)" % args.settings)
+        raise ConfigError("No database configured. Run 'python main.py configure' to add a connection to %s "
+                          "(or pass --database)" % args.connections)
+    log.debug("Using connection '%s'", s.connection_name)
     return s
 
 
@@ -87,14 +98,18 @@ def cmd_test_connection(args):
 
 
 def cmd_configure(args):
-    """Ask connection questions and write settings.yaml."""
-    path = Path(args.settings)
-    from deid.config import DEFAULT_SETTINGS as D, Settings, _deep_merge
-    base = load_settings(str(path)).to_dict() if path.exists() else _deep_merge(D, {})
-    db = base["database"]
-    print("=== Connection settings (%s) ===" % path)
+    """Questions -> connections.yaml (database), settings.yaml (behaviour), paths.yaml, policy in the rules file."""
+    from deid.config import (DEFAULT_CONNECTION, DEFAULT_PATHS as PATH_DEFAULTS, load_connections,
+                             save_connection)
+    # ---- database connection -> connections.yaml
+    existing_default, conns = (load_connections(args.connections) if Path(args.connections).exists() else ("", {}))
+    print("=== Database connection (saved in %s) ===" % args.connections)
+    if conns:
+        print("Existing connections: %s (default: %s)" % (", ".join(conns), existing_default))
+    name = prompts.ask("Connection name (e.g. dev, uat, masking_copy)", args.connection or existing_default or "dev")
+    db = dict(conns.get(name) or DEFAULT_CONNECTION)
     db["server"] = prompts.ask("SQL Server host[,port] or host\\instance", db.get("server") or "localhost")
-    db["database"] = prompts.ask("Database name", db.get("database") or None)
+    db["database"] = prompts.ask("Database name (a NON-production copy)", db.get("database") or None)
     db["driver"] = prompts.ask("ODBC driver", db.get("driver"))
     db["auth"] = prompts.choose("Authentication", ["windows", "sql", "azure_ad_interactive", "azure_ad_password"],
                                 db.get("auth", "windows"))
@@ -104,20 +119,62 @@ def cmd_configure(args):
         db["password_env"] = prompts.ask("Environment variable holding the password", db.get("password_env"))
     db["encrypt"] = prompts.ask_yes_no("Encrypt the connection?", bool(db.get("encrypt", True)))
     db["trust_server_certificate"] = prompts.ask_yes_no(
-        "Trust the server certificate (self-signed/dev servers)?", bool(db.get("trust_server_certificate")))
-    ex = base["execution"]
-    ex["batch_size"] = prompts.ask_int("Rows per update batch", int(ex["batch_size"]), 1)
+        "Trust the server certificate (internal/self-signed certificates)?", bool(db.get("trust_server_certificate")))
+    make_default = (not conns or name == existing_default
+                    or prompts.ask_yes_no("Make '%s' the default connection?" % name, False))
+    save_connection(args.connections, name, db, make_default)
+    print("Saved connection '%s' to %s" % (name, args.connections))
+
+    # ---- behaviour -> settings.yaml
+    settings = load_settings(args.settings, None, None, args.paths)
+    before = settings.to_dict()
+    ex = settings.execution
+    print("\n=== Run settings (saved in %s) ===" % args.settings)
+    raw_bs = prompts.ask("Rows per update batch ('auto' sizes each table from its row size)", str(ex["batch_size"]))
+    ex["batch_size"] = "auto" if raw_bs.strip().lower() == "auto" else max(1, int(raw_bs))
     ex["disable_triggers"] = prompts.ask_yes_no("Disable table triggers while masking?", bool(ex["disable_triggers"]))
     ex["auto_include_fk_columns"] = prompts.ask_yes_no(
         "Automatically mask FK-related columns with the same domain?", bool(ex["auto_include_fk_columns"]))
-    base["audit"]["write_to_db"] = prompts.ask_yes_no(
-        "Write audit tables into the database (schema %s)?" % base["audit"]["schema"], bool(base["audit"]["write_to_db"]))
-    save_settings(Settings(**base), str(path))
-    print("Saved %s" % path)
+    settings.audit["write_to_db"] = prompts.ask_yes_no(
+        "Write audit tables into the database (schema %s)?" % settings.audit["schema"],
+        bool(settings.audit["write_to_db"]))
+    if settings.to_dict() != before or not Path(args.settings).exists():
+        save_settings(settings, args.settings)
+        print("Saved %s" % args.settings)
+    else:
+        print("No changes to %s (kept as is, comments included)" % args.settings)
+
+    # ---- file locations -> paths.yaml (created with defaults the first time)
+    if not Path(args.paths).exists():
+        _write_default_paths(args.paths, PATH_DEFAULTS)
+        print("Created %s (file and folder locations; edit it to move audit/log files)" % args.paths)
+
     ask_policy(args.rules)
     if prompts.ask_yes_no("Test the connection now?", True):
         args.server = args.database = None
+        args.connection = name
         return cmd_test_connection(args)
+    return 0
+
+
+def _write_default_paths(path, defaults):
+    lines = ["# File and folder locations. Relative paths are relative to the project folder.",
+             "# Absolute paths (e.g. D:\\deid\\audit) and %ENV% variables are allowed."]
+    lines += ["%s: %s" % (k, v) for k, v in defaults.items()]
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def cmd_connections(args):
+    """List the database connections in connections.yaml."""
+    from deid.config import load_connections
+    if not Path(args.connections).exists():
+        print("No %s yet. Add a connection with: python main.py configure" % args.connections)
+        return 1
+    default, conns = load_connections(args.connections)
+    for n, c in conns.items():
+        print("  %s %-16s %s / %s  (auth=%s)" % ("*" if n == default else " ", n, c["server"], c["database"], c["auth"]))
+    print("  (* = default; choose another with --connection NAME)")
     return 0
 
 
@@ -302,7 +359,7 @@ def _print_result(result):
 
 
 def cmd_audit_report(args):
-    out_dir = Path(load_settings(args.settings).audit.get("output_dir", "audit"))
+    out_dir = Path(_load(args).audit.get("output_dir", "audit"))
     if args.run_id:
         p = out_dir / args.run_id / "summary.json"
         if not p.exists():
@@ -331,7 +388,7 @@ def cmd_audit_report(args):
 
 def cmd_preview(args):
     """Mask sample values offline (no database) to check algorithms and consistency."""
-    settings = load_settings(args.settings)
+    settings = _load(args)
     keyring = _keyring(settings)
     params = json.loads(args.params) if args.params else {}
     if args.domain and not args.type:
@@ -369,7 +426,7 @@ def cmd_list_types(args):
 
 
 def cmd_key_fingerprint(args):
-    settings = load_settings(args.settings)
+    settings = _load(args)
     fp = _keyring(settings).fingerprint()
     print("Key fingerprint: %s  (algorithm version %d)" % (fp, ALGORITHM_VERSION))
     print("Pin it on every server in settings.yaml:  security.expected_key_fingerprint: %s" % fp)
@@ -393,7 +450,7 @@ SAMPLE_INPUTS = {
 def cmd_test_vectors(args):
     """Write (or check) known-answer masks so every server/environment can prove it masks identically."""
     import csv
-    settings = load_settings(args.settings)
+    settings = _load(args)
     keyring = _keyring(settings)
     rules = load_rules(args.rules)
     maskers = build_maskers(rules.domains.values(), keyring)
@@ -497,16 +554,21 @@ def cmd_recommend(args):
 def build_parser():
     p = argparse.ArgumentParser(prog="pythondeid", description="Deterministic SQL Server de-identification")
     p.add_argument("--version", action="version", version=__version__)
-    p.add_argument("--settings", default=DEFAULT_SETTINGS, help="settings YAML (default %(default)s)")
-    p.add_argument("--rules", default=DEFAULT_RULES, help="rules YAML (default %(default)s)")
+    p.add_argument("--settings", default=DEFAULT_SETTINGS, help="run settings YAML (default config/settings.yaml)")
+    p.add_argument("--connections", default=DEFAULT_CONNECTIONS,
+                   help="database connections YAML (default config/connections.yaml)")
+    p.add_argument("-c", "--connection", help="connection name from connections.yaml (default: its 'default')")
+    p.add_argument("--paths", default=DEFAULT_PATHS, help="file locations YAML (default config/paths.yaml)")
+    p.add_argument("--rules", help="rules YAML (default: rules_file in paths.yaml)")
     p.add_argument("--server", help="override database.server")
     p.add_argument("--database", help="override database.database")
     p.add_argument("-y", "--yes", action="store_true", help="non-interactive: no questions (use with care)")
     sub = p.add_subparsers(dest="command", required=True)
 
     sub.add_parser("genkey", help="generate a secret masking key").set_defaults(func=cmd_genkey)
-    sub.add_parser("configure", help="answer questions: connection settings + masking policy").set_defaults(
+    sub.add_parser("configure", help="answer questions: connection, run settings, masking policy").set_defaults(
         func=cmd_configure)
+    sub.add_parser("connections", help="list database connections").set_defaults(func=cmd_connections)
     sub.add_parser("policy", help="choose full vs last4 (SSN, account, card) and name method").set_defaults(
         func=cmd_policy)
     sub.add_parser("test-connection", help="check database connectivity").set_defaults(func=cmd_test_connection)
@@ -514,7 +576,7 @@ def build_parser():
 
     d = sub.add_parser("discover", help="export table structure + PII suggestions to CSV")
     d.add_argument("--schema", action="append", help="limit to schema (repeatable)")
-    d.add_argument("--out", default="config/discovered_schema.csv")
+    d.add_argument("--out", help="CSV to write (default: discovery_csv in paths.yaml)")
     d.add_argument("--only-suggested", action="store_true", help="only columns that look like PII")
     d.set_defaults(func=cmd_discover)
 
@@ -548,7 +610,7 @@ def build_parser():
         func=cmd_key_fingerprint)
 
     tv = sub.add_parser("test-vectors", help="write/check known-answer masks to prove cross-server consistency")
-    tv.add_argument("--out", default="config/test_vectors.csv")
+    tv.add_argument("--out", help="CSV to write (default: test_vectors in paths.yaml)")
     tv.add_argument("--check", metavar="CSV", help="verify this environment reproduces a vectors file")
     tv.set_defaults(func=cmd_test_vectors)
 
@@ -562,6 +624,11 @@ def build_parser():
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        paths = load_paths(args.paths)
+        if not args.rules:
+            args.rules = paths["rules_file"]
+        if getattr(args, "out", "unset") is None and args.command in ("discover", "test-vectors"):
+            args.out = paths["discovery_csv" if args.command == "discover" else "test_vectors"]
         return args.func(args)
     except (ConfigError, MaskerError, DatabaseError) as exc:
         print("ERROR: %s" % exc, file=sys.stderr)

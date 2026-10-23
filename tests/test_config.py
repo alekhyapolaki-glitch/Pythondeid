@@ -4,9 +4,10 @@ from deid.config import ConfigError, load_rules, load_settings, parse_rules, rul
 
 
 def test_sample_files_load():
-    s = load_settings("config/settings.yaml")
+    s = load_settings("config/settings.yaml", "config/connections.example.yaml", None, "config/paths.yaml")
     r = load_rules("config/deid_rules.yaml")
-    assert s.database["database"]
+    assert s.database["database"] and s.connection_name == "dev"
+    assert "database" not in load_settings("config/settings.yaml").to_dict()  # settings.yaml has no connection
     assert {"email", "ssn", "account_number"} <= set(r.domains)
     assert r.content_hash
 
@@ -89,3 +90,43 @@ def test_update_policy_in_file_keeps_comments(tmp_path):
 def test_sample_rules_policy_section():
     r = load_rules("config/deid_rules.yaml")
     assert set(r.policy) == {"ssn", "account_number", "credit_card", "names", "phone", "address", "city", "zip"}
+
+
+# ----------------------------------------------------------------- separate connection / path files
+from deid.config import load_connections, load_paths, save_connection  # noqa: E402
+
+
+def test_connections_file_select_and_errors(tmp_path):
+    c = tmp_path / "connections.yaml"
+    save_connection(str(c), "dev", {"server": "S1", "database": "D1"}, make_default=True)
+    save_connection(str(c), "uat", {"server": "S2", "database": "D2", "auth": "sql", "username": "u"}, False)
+    default, conns = load_connections(str(c))
+    assert default == "dev" and conns["uat"]["server"] == "S2" and conns["dev"]["auth"] == "windows"
+    s = load_settings("config/settings.yaml", str(c), "uat", None)
+    assert s.database["database"] == "D2" and s.connection_name == "uat"
+    with pytest.raises(ConfigError, match="not in"):
+        load_settings("config/settings.yaml", str(c), "prod", None)
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("connections:\n  x: {server: s, database: d, password: secret}\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="passwords"):
+        load_connections(str(bad))
+
+
+def test_paths_resolve_relative_to_project(tmp_path):
+    p = tmp_path / "paths.yaml"
+    p.write_text("audit_dir: %s\nlog_dir: mylogs\n" % (tmp_path / "aud"), encoding="utf-8")
+    paths = load_paths(str(p))
+    assert paths["audit_dir"] == str(tmp_path / "aud")
+    assert paths["log_dir"].endswith("mylogs") and paths["rules_file"].endswith("deid_rules.yaml")
+    s = load_settings("config/settings.yaml", None, None, str(p))
+    assert s.audit["output_dir"] == str(tmp_path / "aud")
+    p.write_text("audit_folder: x\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="Unknown key"):
+        load_paths(str(p))
+
+
+def test_legacy_settings_with_database_section(tmp_path):
+    legacy = tmp_path / "settings.yaml"
+    legacy.write_text("database: {server: OLD, database: OLDDB}\naudit: {output_dir: oldaudit}\n", encoding="utf-8")
+    s = load_settings(str(legacy), str(tmp_path / "missing.yaml"), None, str(tmp_path / "missing_paths.yaml"))
+    assert s.database["server"] == "OLD" and s.audit["output_dir"].endswith("oldaudit")
