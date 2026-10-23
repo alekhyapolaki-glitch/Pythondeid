@@ -279,3 +279,40 @@ def test_name_method_hash_allowed_on_unique_column():
     assert is_injective("account_name", {"method": "hash"})
     assert not is_injective("account_name", {"method": "realistic"})
     assert not is_injective("full_name", {})
+
+
+# ----------------------------------------------------------------- phone / address / city / zip policy
+def test_phone_modes(keyring):
+    last4 = create_masker("phone", "phone", keyring, {"mode": "last4"})
+    out = last4.mask("(555) 123-4567")
+    assert out.endswith("4567") and out[0] == "(" and out != "(555) 123-4567"
+    area = create_masker("phone", "phone", keyring, {"mode": "area_code"})
+    assert area.mask("(555) 123-4567").startswith("(555) ")
+    assert area.mask("+1 555 222 3333").startswith("+1 555 ")
+    assert area.mask("555.123.4567") != "555.123.4567"
+    vals = ["555%07d" % i for i in range(5000)]
+    assert len({area.mask(v) for v in vals}) == len(vals)          # still collision-free
+    full = create_masker("phone", "phone", keyring)
+    assert full.mask("(555) 123-4567")[1:4] != "555" or full.mask("(555) 123-4567")[-4:] != "4567"
+    with pytest.raises(MaskerError):
+        create_masker("phone", "p", keyring, {"mode": "last4", "preserve_first": 3})
+
+
+def test_address_and_city_methods(keyring):
+    assert create_masker("street_address", "a", keyring, {"method": "redact"}).mask("12 High St") == "REDACTED"
+    h = create_masker("street_address", "a", keyring, {"method": "hash"})
+    assert h.mask("12 High St") == h.mask("12 HIGH ST") and len(h.mask("12 High St")) == 16
+    real = create_masker("street_address", "a", keyring).mask("12 High St")
+    assert real[0].isdigit() and real != "12 High St"
+    assert create_masker("city", "c", keyring, {"method": "redact", "redact_value": "CITY"}).mask("Boston") == "CITY"
+
+
+def test_policy_covers_phone_address_city_zip():
+    r = parse_rules({"policy": {"phone": "area_code", "address": "hash", "city": "redact", "zip": "fpe"},
+                     "tables": [{"table": "T", "columns": [
+                         {"name": "P", "type": "phone"}, {"name": "A", "type": "street_address"},
+                         {"name": "C", "type": "city"}, {"name": "Z", "type": "zip"}]}]})
+    assert r.domains["phone"].params["mode"] == "area_code"
+    assert r.domains["street_address"].params["method"] == "hash"
+    assert r.domains["city"].params["method"] == "redact"
+    assert r.domains["zip"].params["mode"] == "fpe"

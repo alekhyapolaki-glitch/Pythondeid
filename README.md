@@ -79,7 +79,18 @@ policy:
   account_number:  full           # full | last4
   credit_card:     first6_last4   # full | last4 | first6_last4
   names:           realistic      # realistic | hash | redact   (full_name and account_name columns)
+  phone:           full           # full | last4 | area_code
+  address:         realistic      # realistic | hash | redact   (street_address columns)
+  city:            realistic      # realistic | hash | redact
+  zip:             truncate       # truncate (first 3 digits kept) | fpe (fully de-identified)
 ```
+
+| Policy | Values (examples with a demo key) |
+|---|---|
+| `phone` | `full` `(555) 123-4567`→`(568) 988-7543` · `last4` →`(384) 539-4567` · `area_code` →`(555) 137-8309` (also keeps a leading `+1`) |
+| `address` | `realistic` `12 High St`→`4255 River Way` · `hash` →`89d6919c7f05ff94` · `redact` →`REDACTED` |
+| `city` | `realistic` `Boston`→`Milton` · `hash` · `redact` |
+| `zip` | `truncate` `80202-1234`→`80200-0000` · `fpe` →`85819-5248` (unique, nothing kept) |
 
 * Set them with questions: `python main.py policy`. `configure` and `wizard` also ask them.
 * They apply to every domain of that type. A domain that sets `mode`/`method` itself overrides the

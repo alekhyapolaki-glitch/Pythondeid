@@ -15,7 +15,7 @@ try:
 except ImportError:  # PyYAML-ft (free-threading build, e.g. some ActiveState runtimes) installs as yaml_ft
     import yaml_ft as yaml
 
-from .maskers import ALGORITHM_VERSION, MODES, NAME_METHODS, MaskerError, get_masker_class
+from .maskers import ALGORITHM_VERSION, MODES, NAME_METHODS, PHONE_MODES, MaskerError, get_masker_class
 
 
 class ConfigError(Exception):
@@ -265,8 +265,17 @@ POLICY_OPTIONS: Dict[str, Tuple[Tuple[str, ...], str, Tuple[str, ...], str]] = {
                        "Card numbers: full, last4, or first6_last4 (keep BIN + last 4)?"),
     "names":          (("full_name", "account_name"), "method", tuple(NAME_METHODS),
                        "Names: realistic (fake names), hash (unique code) or redact (constant)?"),
+    "phone":          (("phone",), "mode", tuple(PHONE_MODES),
+                       "Phone numbers: full, last4, or area_code (keep area code, mask the rest)?"),
+    "address":        (("street_address",), "method", tuple(NAME_METHODS),
+                       "Street addresses: realistic (fake address), hash (unique code) or redact (constant)?"),
+    "city":           (("city",), "method", tuple(NAME_METHODS),
+                       "Cities: realistic (fake city), hash (unique code) or redact (constant)?"),
+    "zip":            (("zip",), "mode", ("truncate", "fpe"),
+                       "ZIP codes: truncate (keep first 3 digits, HIPAA style) or fpe (all digits de-identified)?"),
 }
-DEFAULT_POLICY = {"ssn": "full", "account_number": "full", "credit_card": "full", "names": "realistic"}
+DEFAULT_POLICY = {"ssn": "full", "account_number": "full", "credit_card": "full", "names": "realistic",
+                  "phone": "full", "address": "realistic", "city": "realistic", "zip": "truncate"}
 
 
 def _parse_policy(raw: Any, source: str) -> Dict[str, str]:
@@ -396,6 +405,10 @@ _POLICY_COMMENTS = {
     "account_number": "full | last4",
     "credit_card": "full | last4 | first6_last4",
     "names": "realistic | hash | redact   (full_name and account_name columns)",
+    "phone": "full | last4 | area_code",
+    "address": "realistic | hash | redact   (street_address columns)",
+    "city": "realistic | hash | redact",
+    "zip": "truncate (first 3 digits kept) | fpe (fully de-identified)",
 }
 
 

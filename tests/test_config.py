@@ -63,22 +63,23 @@ def test_policy_applies_to_domains_without_explicit_setting():
 
 def test_policy_defaults_validation_and_hash():
     default = parse_rules(BASE)
-    assert default.policy == {"ssn": "full", "account_number": "full", "credit_card": "full", "names": "realistic"}
+    assert default.policy["ssn"] == "full" and default.policy["zip"] == "truncate"
     assert default.domains["ssn"].params["mode"] == "full"
     changed = parse_rules(dict(BASE, policy={"ssn": "last4"}))
     assert changed.content_hash != default.content_hash  # masks differ, so the rules fingerprint must too
     with pytest.raises(ConfigError, match="policy.ssn"):
         parse_rules(dict(BASE, policy={"ssn": "first6_last4"}))
     with pytest.raises(ConfigError, match="unknown policy"):
-        parse_rules(dict(BASE, policy={"zip": "full"}))
+        parse_rules(dict(BASE, policy={"country": "full"}))
 
 
 def test_update_policy_in_file_keeps_comments(tmp_path):
     p = tmp_path / "rules.yaml"
     p.write_text("# my rules\nalgorithm_version: 1\n\ndomains:\n  ssn: {type: ssn}   # keep me\n"
                  "tables:\n  - table: T\n    columns: [{name: S, domain: ssn}]\n", encoding="utf-8")
-    update_policy_in_file(str(p), {"ssn": "last4", "account_number": "full", "credit_card": "full", "names": "hash"})
-    update_policy_in_file(str(p), {"ssn": "full", "account_number": "last4", "credit_card": "full", "names": "hash"})
+    from deid.config import DEFAULT_POLICY
+    update_policy_in_file(str(p), dict(DEFAULT_POLICY, ssn="last4", names="hash"))
+    update_policy_in_file(str(p), dict(DEFAULT_POLICY, account_number="last4", names="hash"))
     text = p.read_text(encoding="utf-8")
     assert text.count("policy:") == 1 and "# keep me" in text and "# my rules" in text
     r = load_rules(str(p))
@@ -87,4 +88,4 @@ def test_update_policy_in_file_keeps_comments(tmp_path):
 
 def test_sample_rules_policy_section():
     r = load_rules("config/deid_rules.yaml")
-    assert set(r.policy) == {"ssn", "account_number", "credit_card", "names"}
+    assert set(r.policy) == {"ssn", "account_number", "credit_card", "names", "phone", "address", "city", "zip"}

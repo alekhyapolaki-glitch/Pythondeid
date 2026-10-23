@@ -23,6 +23,10 @@ policy:                   # masking choices; apply to every domain of these type
   account_number:  full           # full | last4
   credit_card:     first6_last4   # full | last4 | first6_last4
   names:           realistic      # realistic | hash | redact   (full_name and account_name columns)
+  phone:           full           # full | last4 | area_code
+  address:         realistic      # realistic | hash | redact   (street_address columns)
+  city:            realistic      # realistic | hash | redact
+  zip:             truncate       # truncate (first 3 digits kept) | fpe (fully de-identified)
 
 domains:
   email:
@@ -56,9 +60,9 @@ domains:
   last_name: {type: last_name}
   street_address: {type: street_address}
   city: {type: city}
-  zip:
+  zip:                      # truncate / fpe comes from policy.zip
     type: zip
-    params: {mode: truncate, keep_digits: 3}
+    params: {keep_digits: 3}
 
   person_dates:             # one offset per person => intervals between a person's dates are preserved
     type: date_shift

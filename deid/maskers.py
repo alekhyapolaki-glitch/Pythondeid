@@ -294,10 +294,34 @@ class AccountNumberMasker(FpeMasker):
         super()._check_params(p)
 
 
+PHONE_MODES = ("full", "last4", "area_code")
+
+
 class PhoneMasker(FpeMasker):
     type_name = "phone"
-    description = "Phone numbers: FPE on digits only, punctuation/format preserved"
-    default_params = dict(FpeMasker.default_params, letters=False)
+    description = ("Phone numbers: FPE on digits only, punctuation/format preserved; "
+                   "mode=full (default) | last4 | area_code (keep the area code, +1 country code included)")
+    default_params = dict(FpeMasker.default_params, letters=False, mode="full")
+
+    @classmethod
+    def _check_params(cls, p):
+        _choice(p, "mode", PHONE_MODES)
+        if p["mode"] != "full" and (p["preserve_first"] or p["preserve_last"]):
+            raise MaskerError("phone mode=%s conflicts with preserve_first/preserve_last; set only one" % p["mode"])
+        super()._check_params(p)
+
+    def _mask(self, value):
+        mode = self.params["mode"]
+        if mode == "full":
+            return super()._mask(value)
+        pf, pl = 0, 0
+        if mode == "last4":
+            pl = 4
+        else:
+            digits = re.sub(r"\D", "", value)
+            # NANP: 10 digits -> keep 3; 11 digits starting with 1 -> keep "1" + area code
+            pf = 4 if (len(digits) == 11 and digits[0] == "1") else (3 if len(digits) >= 10 else 0)
+        return encrypt_text(self._cipher, value, b"phone|" + mode.encode(), pf, pl, True, False)
 
 
 class SsnMasker(BaseMasker):
@@ -500,10 +524,9 @@ NAME_METHODS = ("realistic", "hash", "redact")
 NAME_METHOD_PARAMS = {"method": "realistic", "hash_length": 16, "hash_prefix": "", "redact_value": "REDACTED"}
 
 
-class FullNameMasker(FirstNameMasker):
-    type_name = "full_name"
-    description = ("Person names: method=realistic (fake 'First M. Last', default) | hash (unique token) | "
-                   "redact (constant)")
+class MethodChoiceMasker(FirstNameMasker):
+    """Base for maskers whose algorithm is chosen by 'method': realistic | hash | redact."""
+
     default_params = dict(NAME_METHOD_PARAMS)
 
     @classmethod
@@ -528,6 +551,12 @@ class FullNameMasker(FirstNameMasker):
             return self._delegate.mask(value)
         return super().mask(value, entity)
 
+
+class FullNameMasker(MethodChoiceMasker):
+    type_name = "full_name"
+    description = ("Person names: method=realistic (fake 'First M. Last', default) | hash (unique token) | "
+                   "redact (constant)")
+
     def _mask(self, value):
         text = value.strip()
         if "," in text:
@@ -546,9 +575,9 @@ class FullNameMasker(FirstNameMasker):
         return _match_case(token, self._pick(data.LAST_NAMES, "last", token.lower()))
 
 
-class StreetAddressMasker(FirstNameMasker):
+class StreetAddressMasker(MethodChoiceMasker):
     type_name = "street_address"
-    description = "Replace with a deterministic synthetic street address"
+    description = "Street addresses: method=realistic (fake '4821 Maple Ave', default) | hash | redact"
 
     def _mask(self, value):
         norm = self.canonical(value)
@@ -558,9 +587,9 @@ class StreetAddressMasker(FirstNameMasker):
         return _match_case(value.strip(), "%d %s %s" % (number, street, suffix))
 
 
-class CityMasker(FirstNameMasker):
+class CityMasker(MethodChoiceMasker):
     type_name = "city"
-    description = "Replace with a deterministic city name from a built-in list"
+    description = "Cities: method=realistic (fake city from a list, default) | hash | redact"
 
     def _mask(self, value):
         return _match_case(value.strip(), self._pick(data.CITIES, "city", self.canonical(value)))
@@ -973,12 +1002,12 @@ def is_injective(type_name: str, params: Optional[Dict[str, Any]] = None) -> boo
     cls = get_masker_class(type_name)
     if cls is ZipMasker:
         return (params or {}).get("mode", "truncate") == "fpe"
-    if issubclass(cls, FullNameMasker):
+    if issubclass(cls, MethodChoiceMasker):
         return (params or {}).get("method", "realistic") == "hash"
     return cls.injective
 
 
 __all__ = [
-    "ALGORITHM_VERSION", "KeyRing", "MaskerError", "BaseMasker", "MASKERS", "MODES", "get_masker_class",
+    "ALGORITHM_VERSION", "KeyRing", "MaskerError", "BaseMasker", "MASKERS", "MODES", "PHONE_MODES", "get_masker_class",
     "create_masker", "build_maskers", "column_masker", "is_injective", "normalize_entity",
 ]
