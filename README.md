@@ -64,6 +64,7 @@ a warning.
 | `email` | `user<HMAC token>@example.com` | `token_length` (16), `domain`, `preserve_domain` | ✅ collision-checked |
 | `hash` | HMAC-SHA256 hex | `length`, `prefix` | ✅ collision-checked |
 | `first_name`, `last_name`, `full_name`, `street_address`, `city` | Deterministic pick from lists | — | ❌ not unique |
+| `account_name` | People → fake person names; businesses → fake company words with INC/LLC/LTD and industry words kept (`ACME DEVELOPMENT INC` → `OASIS DEVELOPMENT INC`); trusts/estates keep their wording with fake person names | `keep_industry_words`, `extra_business_words`, `keep_numbers` | ❌ not unique |
 | `zip` | `truncate` (first 3 digits) or `fpe` | `mode`, `keep_digits` | fpe ✅ |
 | `date_shift` | ±N-day shift | `shift_by: value \| entity`, `max_days`, `generalize: none \| year \| month` | ❌ |
 | `free_text` | Regex scrub of PII inside text | see §5 | ❌ |

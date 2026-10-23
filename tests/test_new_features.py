@@ -234,3 +234,28 @@ def test_parallel_equals_in_process(keyring):
     finally:
         pool.close()
     assert got == mask_rows(maskers["email"], rows, True)
+
+
+# ----------------------------------------------------------------- account names (people + businesses)
+def test_account_name_people_and_businesses(keyring):
+    m = create_masker("account_name", "account_name", keyring)
+    assert m.classify("LAURA H TALKO") == "person"
+    assert m.classify("WIDGET DEVELOPMENT INC") == "business"
+    assert m.classify("JOHN SMITH REVOCABLE TRUST") == "person_entity"
+    biz = m.mask("ACME DEVELOPMENT INC")
+    assert biz.endswith(" DEVELOPMENT INC") and not biz.startswith("ACME") and biz.isupper()
+    assert m.mask("CARNOW, CONIBEAR & ASSOC, LTD").endswith(" & ASSOC, LTD")
+    assert m.mask("Acme Development Inc.").endswith(" Development Inc.")
+    trust = m.mask("JOHN SMITH REVOCABLE TRUST")
+    assert trust.endswith(" REVOCABLE TRUST") and "JOHN" not in trust and "SMITH" not in trust
+    person = m.mask("JOHN A SMITH")
+    assert person == create_masker("full_name", "account_name", keyring).mask("JOHN A SMITH")
+    assert m.mask("ACME DEVELOPMENT INC") == biz  # deterministic
+
+
+def test_account_name_options(keyring):
+    m = create_masker("account_name", "n", keyring, {"extra_business_words": ["Bancshares"], "keep_numbers": True})
+    assert m.classify("FIRST MIDWEST BANCSHARES") == "business"
+    assert m.mask("1 FAITH HOLDINGS LLC").startswith("1 ")
+    with pytest.raises(MaskerError):
+        create_masker("account_name", "n", keyring, {"extra_business_words": "LABS"})

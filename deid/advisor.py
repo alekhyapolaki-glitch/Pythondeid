@@ -49,6 +49,11 @@ TYPE_GUIDE: Dict[str, Dict[str, str]] = {
     "first_name": {"input": "varchar/nvarchar", "output": "nvarchar(%d) or longer" % max(map(len, data.FIRST_NAMES)), "notes": ""},
     "last_name": {"input": "varchar/nvarchar", "output": "nvarchar(%d) or longer" % max(map(len, data.LAST_NAMES)), "notes": ""},
     "full_name": {"input": "varchar/nvarchar", "output": "nvarchar(50) or longer recommended", "notes": ""},
+    "account_name": {
+        "input": "varchar/nvarchar holding person OR business names",
+        "output": "same as input; nvarchar(60)+ recommended (fake company words can be longer than the original)",
+        "notes": "INC/LLC/LTD and industry words are kept; add your own generic words via extra_business_words",
+    },
     "street_address": {"input": "varchar/nvarchar", "output": "nvarchar(30) or longer", "notes": ""},
     "city": {"input": "varchar/nvarchar", "output": "nvarchar(%d) or longer" % max(map(len, data.CITIES)), "notes": ""},
     "zip": {"input": "char(5), varchar(10), int", "output": "same as input", "notes": ""},
@@ -90,7 +95,7 @@ def required_output_chars(mtype: str, params: Dict[str, Any], input_chars: Optio
         return 4 + 1 + max(map(len, data.STREET_NAMES)) + 1 + max(map(len, data.STREET_SUFFIXES))
     if mtype == "redact":
         return input_chars if p["preserve_length"] else len(str(p["value"]))
-    if mtype in ("nullify", "full_name", "free_text"):
+    if mtype in ("nullify", "full_name", "free_text", "account_name"):
         return None
     return input_chars
 

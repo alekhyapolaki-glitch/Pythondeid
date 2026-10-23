@@ -43,6 +43,10 @@ domains:
     type: credit_card
     params: {mode: first6_last4}   # full | last4 | first6_last4
 
+  account_name:             # people -> fake person names; businesses -> fake company names keeping INC/LLC/...
+    type: account_name
+    params: {keep_industry_words: true, extra_business_words: []}
+
   phone: {type: phone}
   first_name: {type: first_name}
   last_name: {type: last_name}

@@ -20,7 +20,9 @@ SUGGESTIONS: List[Tuple[str, str]] = [
     (r"phone|mobile|cell|(^|_)fax|(^|_)tel($|_)", "phone"),
     (r"first_?name|(^|_)fname|given_?name|forename", "first_name"),
     (r"last_?name|(^|_)lname|surname|family_?name", "last_name"),
-    (r"full_?name|^name$|customer_?name|patient_?name|contact_?name", "full_name"),
+    (r"acc(oun)?t_?name|customer_?name|cust_?name|client_?name|party_?name|borrower_?name|owner_?name|"
+     r"name_?on_?acc", "account_name"),
+    (r"full_?name|^name$|patient_?name|contact_?name", "full_name"),
     (r"address|(^|_)addr|street", "street_address"),
     (r"(^|_)city($|_)|town", "city"),
     (r"zip|postal|post_?code", "zip"),

@@ -26,7 +26,7 @@ Masker families
   ``ssn``, ``phone``, ``credit_card``, ``zip`` (mode=fpe) - safe for keys.
 * keyed tokens: ``email``, ``hash`` - collision-checked at run time.
 * dictionary substitution: ``first_name``, ``last_name``, ``full_name``,
-  ``street_address``, ``city`` - realistic, NOT unique.
+  ``account_name`` (people and businesses), ``street_address``, ``city`` - realistic, NOT unique.
 * generalisation / suppression: ``zip`` (truncate), ``date_shift`` (per value
   or per person), ``redact``, ``nullify``.
 * ``free_text``: scrub PII patterns inside notes/comments (optionally masking
@@ -534,6 +534,83 @@ class CityMasker(FirstNameMasker):
         return _match_case(value.strip(), self._pick(data.CITIES, "city", self.canonical(value)))
 
 
+_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.'/]*|[^A-Za-z0-9\s]+|\s+")
+
+
+class AccountNameMasker(FullNameMasker):
+    """Account / customer / party names that may be a person OR a business.
+
+    * person ("LAURA H TALKO", "SMITH, JOHN")  -> fake person name, like full_name
+    * business ("ACME DEVELOPMENT INC")         -> "SUMMIT DEVELOPMENT INC": identifying words replaced
+      by company-style words; legal suffixes and generic industry words kept (keep_industry_words)
+    * person-held entity ("JOHN SMITH REVOCABLE TRUST") -> "STEPHEN STEWART REVOCABLE TRUST"
+    Punctuation, spacing and upper/lower case are kept.  Each word maps deterministically, so the same
+    business name masks identically in every table and server.  Not unique (do not use on keys).
+    """
+
+    type_name = "account_name"
+    description = ("Account/customer names that may be people or businesses: people -> fake person names, "
+                   "businesses -> fake company names keeping INC/LLC/LTD and industry words")
+    default_params = {"keep_industry_words": True, "extra_business_words": [], "keep_numbers": False}
+
+    @classmethod
+    def _check_params(cls, p):
+        if not isinstance(p["extra_business_words"], list):
+            raise MaskerError("account_name.extra_business_words must be a list of words, e.g. [BANCSHARES, LABS]")
+
+    def _setup(self):
+        self._generic = (data.BUSINESS_SUFFIXES | data.INDUSTRY_WORDS
+                         | {str(w).upper().rstrip(".") for w in self.params["extra_business_words"]})
+        self._first_set = {n.upper() for n in data.FIRST_NAMES}
+
+    @staticmethod
+    def _norm(token):
+        return token.upper().rstrip(".,")
+
+    def classify(self, value: str) -> str:
+        words = [self._norm(t) for t in _TOKEN_RE.findall(value) if t.strip() and t[0].isalnum()]
+        if any(w in data.PERSONAL_ENTITY_WORDS for w in words):
+            return "person_entity"
+        if any(w in self._generic for w in words) or "&" in value or any(ch.isdigit() for ch in value):
+            return "business"
+        return "person"
+
+    def _business_word(self, token):
+        return _match_case(token, self._pick(data.COMPANY_WORDS, "biz", token.lower()))
+
+    def _person_word(self, token):
+        if self._norm(token) in self._first_set:
+            return self._first(token)
+        return self._last(token)
+
+    def _mask(self, value):
+        kind = self.classify(value)
+        if kind == "person":
+            return super()._mask(value)
+        out = []
+        for tok in _TOKEN_RE.findall(value):
+            w = self._norm(tok)
+            if not tok.strip() or not tok[0].isalnum() or w in data.CONNECTOR_WORDS:
+                out.append(tok)
+            elif w in data.PERSONAL_ENTITY_WORDS or (self.params["keep_industry_words"] and w in self._generic):
+                out.append(tok)
+            elif tok.isdigit():
+                if self.params["keep_numbers"]:
+                    out.append(tok)
+                else:
+                    n = self._int("biz-num", tok)
+                    digits = str(n % (10 ** len(tok))).zfill(len(tok))
+                    out.append(digits if len(tok) == 1 or digits[0] != "0" else "1" + digits[1:])
+            elif len(w) == 1:
+                out.append(_match_case(tok, "ABCDEFGHJKLMNPRSTW"[self._int("biz-init", w) % 18]))
+            else:
+                trail = tok[len(tok.rstrip(".,")):]
+                core = tok[: len(tok) - len(trail)]
+                repl = self._person_word(core) if kind == "person_entity" else self._business_word(core)
+                out.append(repl + trail)
+        return "".join(out)
+
+
 # =============================================================================
 # Generalisation / suppression
 # =============================================================================
@@ -819,7 +896,7 @@ MASKERS: Dict[str, Type[BaseMasker]] = {
     for cls in (
         EmailMasker, SsnMasker, AccountNumberMasker, CreditCardMasker, PhoneMasker, FpeMasker, HashMasker,
         FirstNameMasker, LastNameMasker, FullNameMasker, StreetAddressMasker, CityMasker, ZipMasker,
-        DateShiftMasker, RedactMasker, NullifyMasker, FreeTextMasker,
+        DateShiftMasker, RedactMasker, NullifyMasker, FreeTextMasker, AccountNameMasker,
     )
 }
 
