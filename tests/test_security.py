@@ -5,7 +5,8 @@ import csv
 import pytest
 
 from deid.config import parse_rules
-from deid.db import DatabaseError, build_connection_string, quote_ident
+from deid.database.connection import DatabaseError, build_connection_string
+from deid.database.sql import quote_ident
 from deid.files import FileDeidentifier, FileRuleError, find_inputs, parse_file_rules
 
 RULES = parse_rules({"domains": {"email": {"type": "email"}},

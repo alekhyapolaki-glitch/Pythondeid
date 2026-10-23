@@ -1,4 +1,4 @@
-"""SQL Server connection and execution helpers (pyodbc)."""
+"""SQL Server connections (pyodbc), connection strings, retries for transient errors."""
 
 from __future__ import annotations
 
@@ -25,22 +25,6 @@ def _pyodbc():
             "pyodbc is not installed in this runtime. With the ActiveState State Tool run: state install pyodbc"
         ) from exc
     return pyodbc
-
-
-def quote_ident(name: str) -> str:
-    """Quote a SQL Server identifier: my]col -> [my]]col].
-
-    This is the ONLY way identifiers enter SQL text in this tool; every data value is a ? parameter.
-    """
-    if not isinstance(name, str) or name == "":
-        raise ValueError("Empty SQL identifier")
-    if len(name) > 128 or "\x00" in name:
-        raise ValueError("Invalid SQL identifier (longer than 128 characters or contains NUL)")
-    return "[" + name.replace("]", "]]") + "]"
-
-
-def qualified(schema: str, table: str) -> str:
-    return "%s.%s" % (quote_ident(schema), quote_ident(table))
 
 
 def _odbc_value(value: Any) -> str:

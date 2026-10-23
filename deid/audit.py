@@ -22,7 +22,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .db import quote_ident
+from .database.sql import quote_ident
 
 log = logging.getLogger(__name__)
 

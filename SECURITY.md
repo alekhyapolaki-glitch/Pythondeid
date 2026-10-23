@@ -40,7 +40,7 @@ contain input values.
 * **SQL:**
   * Every data value is sent as a `?` parameter.
   * Identifiers (schema, table, column, index and trigger names) come from SQL Server's own
-    catalog or the validated config, and only enter SQL through `quote_ident()`. That function
+    catalog or the validated config, and only enter SQL through `quote_ident()` (`deid/database/sql.py`). That function
     bracket-quotes, escapes `]`, and rejects empty, NUL-containing or over-128-character names.
   * Catalog queries are fully static.
   * Bandit's B608 findings were reviewed one by one and are marked `# nosec B608` on those lines.

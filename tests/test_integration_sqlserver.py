@@ -15,9 +15,9 @@ from pathlib import Path
 import pytest
 
 from deid.config import DEFAULT_SETTINGS, Settings, _deep_merge, load_rules, validate_connection
-from deid.db import ConnectionFactory
+from deid.database.connection import ConnectionFactory
 from deid.engine import Engine
-from deid.maskers import KeyRing
+from deid.masking import KeyRing
 
 ROOT = Path(__file__).resolve().parents[1]
 pytestmark = pytest.mark.skipif(not os.environ.get("DEID_IT_SERVER"), reason="DEID_IT_SERVER not set")

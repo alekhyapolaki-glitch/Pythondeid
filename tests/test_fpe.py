@@ -1,6 +1,6 @@
 import itertools
 
-from deid.fpe import FeistelCipher, encrypt_text
+from deid.masking.fpe import FeistelCipher, encrypt_text
 
 
 def test_bijection_over_full_small_domains():

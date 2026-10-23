@@ -8,9 +8,8 @@ import pytest
 openpyxl = pytest.importorskip("openpyxl")
 
 from deid.config import parse_rules  # noqa: E402
-from deid.files import (FileDeidentifier, FileRuleError, draft_file_rules, find_inputs,  # noqa: E402
-                        parse_file_rules)
-from deid.maskers import build_maskers  # noqa: E402
+from deid.files import FileDeidentifier, FileRuleError, draft_file_rules, find_inputs, parse_file_rules  # noqa: E402
+from deid.masking import build_maskers  # noqa: E402
 
 RULES = parse_rules({
     "policy": {"ssn": "full", "names": "realistic"},

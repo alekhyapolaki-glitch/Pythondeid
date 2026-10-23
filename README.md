@@ -385,30 +385,62 @@ the counts from before masking.
 ## 9. Project layout
 
 ```
-main.py                    CLI: genkey, key-fingerprint, configure, test-connection, discover, import-csv,
-                           wizard, recommend, validate, dry-run, run, audit-report, preview, list-types,
-                           test-vectors
-config/connections.yaml    database connections for this machine (not in Git; see connections.example.yaml)
-config/paths.yaml          file and folder locations (rules file, audit, logs, CSVs)
-config/settings.yaml       security (key fingerprint), execution, batching, audit, logging level
-config/deid_rules.yaml     algorithm_version, domains, tables/columns (+ type/format/entity options)
-deid/config.py             YAML/CSV loading and validation
-deid/maskers.py            masking algorithms, key derivation, free-text scrubber, registry
-deid/fpe.py                Feistel format-preserving encryption
-deid/engine.py             planner (integrity, types, strategy, batch size) + executor
-deid/advisor.py            type guide, batch sizing, DB readiness, column profiling
-deid/parallel.py           multi-process masking
-deid/schema.py             catalog: columns, keys, unique indexes, FKs, sizes, type parsing
-deid/audit.py              DB + file audit trail, checkpoints
-deid/db.py                 pyodbc connections, quoting, retries
-deid/discovery.py          PII heuristics, CSV export, interactive wizard
-deid/files.py              CSV / Excel de-identification (file rules, discovery, processing)
-config/file_rules.yaml     CSV/Excel field config (files, sheets, columns -> domains)
-samples/input/             synthetic example CSV and Excel files
-deid/prompts.py            console questions
-sql/sample_schema.sql      demo DB: cross-table PII, bigint/varchar ids, visits with notes
-tests/                     unit tests + opt-in live SQL Server tests (DEID_IT_SERVER)
+main.py                         entry point only (12 lines) -> deid.cli
+config/                         CONFIGURATION (no code, no secrets)
+  connections.yaml                database connections, per machine (not in Git; template: connections.example.yaml)
+  paths.yaml                      file and folder locations
+  settings.yaml                   how the tool runs
+  deid_rules.yaml                 what to mask in the database: policy, domains, tables
+  file_rules.yaml                 what to mask in CSV/Excel files
+deid/                           APPLICATION CODE, one responsibility per module
+  cli/                            command-line layer (parsing and user interaction only)
+    parser.py                       argument parser + routing
+    common.py                       shared CLI helpers (load config, key, logging, policy questions)
+    setup_commands.py               genkey, key-fingerprint, configure, connections, policy, test-connection
+    db_commands.py                  discover, import-csv, wizard, recommend, validate, dry-run, run, audit-report
+    file_commands.py                files-discover, files-validate, files-run
+    tool_commands.py                preview, list-types, test-vectors
+  config/                         loading + validation of each config file
+    base.py, connections.py, paths.py, settings.py, rules.py, policy.py
+  masking/                        masking algorithms (no I/O, no database)
+    keys.py                         secret key, per-domain keys, fingerprint
+    base.py                         BaseMasker, MaskerError, shared helpers
+    fpe.py                          Feistel format-preserving cipher
+    identifiers.py                  ssn, account_number, phone, credit_card, fpe
+    tokens.py                       email, hash
+    names.py                        names, account names, street address, city
+    generalize.py                   zip, date_shift, redact, nullify
+    free_text.py                    PII scrubbing in text
+    registry.py                     mask-type registry and factories
+    suggestions.py                  column-name heuristics
+    data.py                         substitution word lists
+  database/                       SQL Server access
+    connection.py                   connections, connection strings, retries
+    sql.py                          quote_ident() and canonical SQL expressions
+    schema.py                       catalog introspection (columns, keys, indexes, FKs, sizes)
+    discovery.py                    schema export to CSV, interactive rules wizard
+  engine/                         database de-identification
+    planner.py                      validate rules vs schema, FK integrity, strategy, batch size
+    sql.py                          SQL of the update (value map, batched UPDATE)
+    validation.py                   masked value fits the column?
+    executor.py                     runs the plan: map, update, constraints, checkpoints, audit
+    parallel.py                     multi-process masking
+  files/                          CSV / Excel de-identification
+    rules.py                        file_rules.yaml model and validation
+    processor.py                    reading/writing files, value cache, parallel pre-masking
+    discovery.py                    drafts file_rules.yaml from headers
+  audit.py                        audit trail (database tables + local files)
+  advisor.py                      type guide, batch sizing, DB readiness, column profiling
+  utils/                          generic helpers: prompts.py (console questions), logging_setup.py
+sql/                            demo database script
+samples/input/                  synthetic CSV/Excel examples
+tests/                          unit, security-regression, architecture and live SQL Server tests
 ```
+
+Layering is enforced by `tests/test_architecture.py`: `masking` and `utils` depend on nothing;
+`config` → `masking`; `database` → `config`/`masking`; `engine` → `database`/`config`/`masking`;
+`files` → `engine`/`config`/`masking`; only `cli` talks to the user. The same test caps module size
+and requires every module to have a docstring.
 
 ## Quality and security status
 

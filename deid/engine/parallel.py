@@ -12,7 +12,7 @@ from collections import deque
 from concurrent.futures import ProcessPoolExecutor
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
-from .maskers import BaseMasker, KeyRing, MaskerError, build_maskers, column_masker
+from ..masking import BaseMasker, KeyRing, MaskerError, build_maskers, column_masker
 
 # (hash, masked or None, error or None, canonical digest or None)
 Result = Tuple[bytes, Optional[str], Optional[str], Optional[bytes]]

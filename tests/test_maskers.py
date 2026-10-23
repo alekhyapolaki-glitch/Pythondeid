@@ -1,6 +1,7 @@
 import pytest
 
-from deid.maskers import CreditCardMasker, KeyRing, MaskerError, SsnMasker, create_masker
+from deid.masking import KeyRing, MaskerError, create_masker
+from deid.masking.identifiers import CreditCardMasker, SsnMasker
 
 
 def test_same_domain_same_output_across_instances(keyring):

@@ -1,0 +1,127 @@
+"""Shared CLI helpers: config file defaults, loading settings/key/logging, the masking-policy questions."""
+
+from __future__ import annotations
+
+import json
+import logging
+from pathlib import Path
+
+from ..config import (
+    PROJECT_ROOT,
+    ConfigError,
+    load_rules,
+    load_settings,
+)
+from ..database.connection import ConnectionFactory
+from ..masking import KeyRing
+from ..utils import prompts
+
+log = logging.getLogger("deid")
+
+
+# Config files (relative to the project folder, so the tool works from any current directory):
+DEFAULT_SETTINGS = str(PROJECT_ROOT / "config" / "settings.yaml")        # how it runs
+
+
+DEFAULT_CONNECTIONS = str(PROJECT_ROOT / "config" / "connections.yaml")  # database connections (this machine)
+
+
+DEFAULT_PATHS = str(PROJECT_ROOT / "config" / "paths.yaml")              # file and folder locations
+
+
+def _load(args):
+    """settings.yaml + the selected connection from connections.yaml + paths.yaml."""
+    return load_settings(args.settings, args.connections, args.connection, args.paths)
+
+
+def _settings(args):
+    s = _load(args)
+    if getattr(args, "server", None):
+        s.database["server"] = args.server
+    if getattr(args, "database", None):
+        s.database["database"] = args.database
+    if not s.database.get("database"):
+        raise ConfigError("No database configured. Run 'python main.py configure' to add a connection to %s "
+                          "(or pass --database)" % args.connections)
+    log.debug("Using connection '%s'", s.connection_name)
+    return s
+
+
+def _keyring(settings) -> KeyRing:
+    sec = settings.security
+    return KeyRing.from_env(sec.get("secret_key_env", "DEID_SECRET_KEY"), int(sec.get("min_key_length", 32)))
+
+
+def _setup_logging(settings, name="deid"):
+    from deid.utils.logging_setup import setup_logging
+    return setup_logging(settings.logging.get("level", "INFO"), settings.logging.get("dir", "logs"), name)
+
+
+def _engine(args, settings, rules):
+    from deid.engine import Engine
+    factory = ConnectionFactory(settings.database, interactive=not args.yes)
+    return Engine(settings, rules, _keyring(settings), factory)
+
+
+def _plan(args):
+    settings = _settings(args)
+    _setup_logging(settings)
+    rules = load_rules(args.rules)
+    engine = _engine(args, settings, rules)
+    info = engine.connect()
+    plan = engine.plan()
+    return settings, rules, engine, info, plan
+
+
+def _print_result(result):
+    print("\nRun %s finished: %s" % (result["run_id"], result["status"]))
+    print("  tables completed: %d / %d" % (result["tables_completed"], result["tables"]))
+    print("  rows updated:     %d" % result["rows_updated"])
+    for f in result["failures"]:
+        print("  FAILURE: %s" % f)
+    print("  audit files:      %s" % result["audit_dir"])
+
+
+def _last_dry_run(settings, rules, info):
+    """run_id of the newest DRY_RUN_OK for the same rules, key and database, if any."""
+    out_dir = Path(settings.audit.get("output_dir", "audit"))
+    fingerprint = _keyring(settings).fingerprint()
+    for p in sorted(out_dir.glob("*/summary.json"), reverse=True):
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+        except ValueError:
+            continue
+        if (d.get("mode") == "dry-run" and d.get("status") == "DRY_RUN_OK" and d.get("rules_hash") == rules.content_hash
+                and d.get("key_fingerprint") == fingerprint and d.get("database") == info["database"]):
+            return d.get("run_id")
+    return None
+
+
+def current_policy(rules_path: str):
+    """Policy from the rules file (even one without tables yet), else the defaults."""
+    from deid.config import DEFAULT_POLICY, _parse_policy, _read_yaml
+    try:
+        return _parse_policy(_read_yaml(Path(rules_path)).get("policy"), rules_path)
+    except ConfigError:
+        return dict(DEFAULT_POLICY)
+
+
+def ask_policy(rules_path: str) -> dict:
+    """The masking-policy questions (full vs last4, name method); saved into the rules file."""
+    from deid.config import POLICY_OPTIONS, update_policy_in_file
+    policy = current_policy(rules_path)
+    print("\n=== Masking policy (stored at the top of %s) ===" % rules_path)
+    print("These choices apply to every column of that kind. Keeping last 4 digits reduces protection.")
+    for key, (_, _, allowed, question) in POLICY_OPTIONS.items():
+        policy[key] = prompts.choose(question, list(allowed), policy[key])
+    update_policy_in_file(rules_path, policy)
+    print("Saved policy: %s" % ", ".join("%s=%s" % kv for kv in policy.items()))
+    print("Masked values change when the policy changes: use the same policy on every server.")
+    return policy
+
+
+def _check_key_pin(settings, keyring):
+    pinned = (settings.security.get("expected_key_fingerprint") or "").strip()
+    if pinned and pinned != keyring.fingerprint():
+        raise ConfigError("DEID_SECRET_KEY does not match security.expected_key_fingerprint (%s, got %s)"
+                          % (pinned, keyring.fingerprint()))

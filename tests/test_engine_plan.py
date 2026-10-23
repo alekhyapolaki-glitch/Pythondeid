@@ -1,6 +1,6 @@
 from deid.config import parse_rules
+from deid.database.schema import ColumnInfo, ForeignKey, SchemaCatalog, TableInfo
 from deid.engine import build_plan, check_fits, distinct_values_sql, update_sql
-from deid.schema import ColumnInfo, ForeignKey, SchemaCatalog, TableInfo
 
 EX = {"auto_include_fk_columns": True}
 

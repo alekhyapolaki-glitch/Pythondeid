@@ -5,10 +5,10 @@ import pytest
 
 from deid.advisor import recommend_batch_size, required_output_chars
 from deid.config import ConfigError, parse_rules
+from deid.database.schema import ColumnInfo, IndexInfo, SchemaCatalog, TableInfo, parse_type, same_type
 from deid.engine import build_plan, distinct_values_sql, update_sql
-from deid.maskers import MaskerError, build_maskers, column_masker, create_masker
-from deid.parallel import MaskingPool, mask_rows
-from deid.schema import ColumnInfo, IndexInfo, SchemaCatalog, TableInfo, parse_type, same_type
+from deid.engine.parallel import MaskingPool, mask_rows
+from deid.masking import MaskerError, build_maskers, column_masker, create_masker
 
 
 # ----------------------------------------------------------------- last-4 modes
@@ -275,7 +275,7 @@ def test_name_methods_pick_existing_algorithms(keyring):
 
 
 def test_name_method_hash_allowed_on_unique_column():
-    from deid.maskers import is_injective
+    from deid.masking import is_injective
     assert is_injective("account_name", {"method": "hash"})
     assert not is_injective("account_name", {"method": "realistic"})
     assert not is_injective("full_name", {})

@@ -10,10 +10,9 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from . import data
-from .db import quote_ident
-from .maskers import get_masker_class
-from .schema import ColumnInfo, TableInfo
+from .database.schema import ColumnInfo, TableInfo
+from .database.sql import quote_ident
+from .masking import data, get_masker_class
 
 log = logging.getLogger(__name__)
 MB = 1024 * 1024
@@ -188,7 +187,7 @@ def _pattern(value: str) -> str:
 
 
 def profile_column(conn, table: TableInfo, col: ColumnInfo, sample: int = 5000) -> Dict[str, Any]:
-    from .engine import text_expr  # local import: engine imports this module
+    from .database.sql import text_expr
     cur = conn.cursor()
     cur.execute("SELECT TOP (?) %s FROM %s.%s AS t WHERE t.%s IS NOT NULL" % (  # nosec B608
         text_expr("t", col), quote_ident(table.schema), quote_ident(table.name), quote_ident(col.name)), [sample])
