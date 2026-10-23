@@ -80,7 +80,8 @@ def _print_table(t: TableInfo) -> None:
             "pk" if c.name.lower() in pk else "", suggest_type(c) or ""))
 
 
-def run_wizard(catalog: SchemaCatalog, existing: Optional[Rules] = None) -> Rules:
+def run_wizard(catalog: SchemaCatalog, existing: Optional[Rules] = None,
+               policy: Optional[Dict[str, str]] = None) -> Rules:
     print("\n=== De-identification rules wizard ===")
     print("Answer the questions below; press Enter to accept the [default].\n")
     domains: Dict[str, DomainRule] = dict(existing.domains) if existing else {}
@@ -156,6 +157,8 @@ def run_wizard(catalog: SchemaCatalog, existing: Optional[Rules] = None) -> Rule
             tables = kept + tables
     used = {c.domain for t in tables for c in t.columns}
     rules = Rules({k: v for k, v in domains.items() if k in used}, tables)
+    if policy:
+        rules.policy = dict(policy)
     rules.content_hash = rules.compute_hash()
     return rules
 
@@ -163,20 +166,11 @@ def run_wizard(catalog: SchemaCatalog, existing: Optional[Rules] = None) -> Rule
 def _ask_key_questions(mtype: str, col: ColumnInfo, domains: Dict[str, DomainRule]) -> Dict[str, object]:
     """The decisions that matter most per type, asked in plain language."""
     p: Dict[str, object] = {}
-    if mtype in ("ssn", "account_number"):
-        p["mode"] = prompts.choose("    De-identify fully, or keep the last 4 characters?", ["full", "last4"], "full")
-    elif mtype == "credit_card":
-        p["mode"] = prompts.choose("    Card numbers: full, last4, or first6_last4 (PCI display)?",
-                                   ["full", "last4", "first6_last4"], "full")
     if mtype in ("account_number", "fpe") and prompts.ask_yes_no(
             "    Is this identifier stored as a NUMBER in some tables and as text/zero-padded in others?",
             col.family in ("int", "decimal")):
         p["normalize"] = "digits"
         p["pad_to"] = prompts.ask_int("    Maximum number of digits the identifier can have", 12, 1)
-    if mtype in ("full_name", "account_name"):
-        print("    realistic = fake names (businesses keep INC/LLC/industry words) | hash = unique code | "
-              "redact = constant")
-        p["method"] = prompts.choose("    How should names be masked?", ["realistic", "hash", "redact"], "realistic")
     if mtype == "date_shift":
         if prompts.ask_yes_no("    Shift all dates of the same person by the same offset (keeps intervals)?", True):
             p["shift_by"] = "entity"

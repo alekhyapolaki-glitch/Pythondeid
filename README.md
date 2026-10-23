@@ -70,13 +70,23 @@ a warning.
 | `free_text` | Regex scrub of PII inside text | see §5 | ❌ |
 | `redact`, `nullify` | Constant / NULL | `value`, `preserve_length` | ❌ |
 
-**Last-4 option.** Choose per domain in `config/deid_rules.yaml`:
+**Masking policy (full vs last 4, name method).** These choices sit in one place, the `policy:`
+section at the top of `config/deid_rules.yaml`:
 
 ```yaml
-ssn:            {type: ssn, params: {mode: full}}          # or: mode: last4  -> ***-**-6789 kept
-account_number: {type: account_number, params: {mode: last4}}  # or: mode: full
-card_number:    {type: credit_card, params: {mode: first6_last4}}
+policy:
+  ssn:             full           # full | last4
+  account_number:  full           # full | last4
+  credit_card:     first6_last4   # full | last4 | first6_last4
+  names:           realistic      # realistic | hash | redact   (full_name and account_name columns)
 ```
+
+* Set them with questions: `python main.py policy`. `configure` and `wizard` also ask them.
+* They apply to every domain of that type. A domain that sets `mode`/`method` itself overrides the
+  policy for that domain only.
+* The plan printed by `validate`, `dry-run` and `run` shows the resulting `[mode=…]`/`[method=…]`
+  per column before anything changes.
+* Masked values depend on these choices, so use the same policy on every server.
 
 The masked part stays collision-free in both modes. Keeping the last 4 digits weakens the
 protection: `last4` SSNs are not HIPAA Safe Harbor de-identified, so `full` is the default.
@@ -219,10 +229,11 @@ setx DEID_SECRET_KEY "<key>"           :: on every server / machine that masks
 python main.py key-fingerprint         :: put the fingerprint in settings.yaml -> security.expected_key_fingerprint
 ```
 
-### Step 4: Connection (asks questions)
+### Step 4: Connection and masking policy (asks questions)
 ```bat
-python main.py configure
+python main.py configure               :: connection questions + policy (full/last4, name method)
 python main.py test-connection
+python main.py policy                  :: change only the policy later
 ```
 The password goes in the `DEID_DB_PASSWORD` environment variable, never in a file.
 `db_owner` on the masking copy is simplest. Demo database:

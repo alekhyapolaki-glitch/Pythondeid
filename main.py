@@ -114,9 +114,44 @@ def cmd_configure(args):
         "Write audit tables into the database (schema %s)?" % base["audit"]["schema"], bool(base["audit"]["write_to_db"]))
     save_settings(Settings(**base), str(path))
     print("Saved %s" % path)
+    ask_policy(args.rules)
     if prompts.ask_yes_no("Test the connection now?", True):
         args.server = args.database = None
         return cmd_test_connection(args)
+    return 0
+
+
+def current_policy(rules_path: str):
+    """Policy from the rules file (even one without tables yet), else the defaults."""
+    from deid.config import DEFAULT_POLICY, _parse_policy, _read_yaml
+    try:
+        return _parse_policy(_read_yaml(Path(rules_path)).get("policy"), rules_path)
+    except ConfigError:
+        return dict(DEFAULT_POLICY)
+
+
+def ask_policy(rules_path: str) -> dict:
+    """The masking-policy questions (full vs last4, name method); saved into the rules file."""
+    from deid.config import POLICY_OPTIONS, update_policy_in_file
+    policy = current_policy(rules_path)
+    print("\n=== Masking policy (stored at the top of %s) ===" % rules_path)
+    print("These choices apply to every column of that kind. Keeping last 4 digits reduces protection.")
+    for key, (_, _, allowed, question) in POLICY_OPTIONS.items():
+        policy[key] = prompts.choose(question, list(allowed), policy[key])
+    update_policy_in_file(rules_path, policy)
+    print("Saved policy: %s" % ", ".join("%s=%s" % kv for kv in policy.items()))
+    print("Masked values change when the policy changes: use the same policy on every server.")
+    return policy
+
+
+def cmd_policy(args):
+    ask_policy(args.rules)
+    if Path(args.rules).exists():
+        try:
+            load_rules(args.rules)
+        except ConfigError as exc:
+            if "defines no tables" not in str(exc):
+                raise
     return 0
 
 
@@ -152,7 +187,14 @@ def cmd_wizard(args):
     existing = None
     if Path(args.rules).exists() and prompts.ask_yes_no("Start from the existing %s?" % args.rules, True):
         existing = load_rules(args.rules)
-    rules = run_wizard(catalog, existing)
+    policy = ask_policy(args.rules) if Path(args.rules).exists() else None
+    if policy is None:
+        from deid.config import POLICY_OPTIONS
+        policy = current_policy(args.rules)
+        print("\n=== Masking policy ===")
+        for key, (_, _, allowed, question) in POLICY_OPTIONS.items():
+            policy[key] = prompts.choose(question, list(allowed), policy[key])
+    rules = run_wizard(catalog, existing, policy)
     if not rules.tables:
         print("Nothing selected; rules not written.")
         return 1
@@ -463,7 +505,10 @@ def build_parser():
     sub = p.add_subparsers(dest="command", required=True)
 
     sub.add_parser("genkey", help="generate a secret masking key").set_defaults(func=cmd_genkey)
-    sub.add_parser("configure", help="answer questions to create settings.yaml").set_defaults(func=cmd_configure)
+    sub.add_parser("configure", help="answer questions: connection settings + masking policy").set_defaults(
+        func=cmd_configure)
+    sub.add_parser("policy", help="choose full vs last4 (SSN, account, card) and name method").set_defaults(
+        func=cmd_policy)
     sub.add_parser("test-connection", help="check database connectivity").set_defaults(func=cmd_test_connection)
     sub.add_parser("list-types", help="list mask types and parameters").set_defaults(func=cmd_list_types)
 

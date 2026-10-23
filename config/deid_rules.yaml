@@ -18,35 +18,36 @@
 # ---------------------------------------------------------------------------
 algorithm_version: 1      # pin: all servers must run the same masking algorithm version
 
+policy:                   # masking choices; apply to every domain of these types that does not set them itself
+  ssn:             full           # full | last4
+  account_number:  full           # full | last4
+  credit_card:     first6_last4   # full | last4 | first6_last4
+  names:           realistic      # realistic | hash | redact   (full_name and account_name columns)
+
 domains:
   email:
     type: email
     params: {domain: example.com, token_length: 16}
 
-  ssn:
+  ssn:                      # full / last4 comes from policy.ssn
     type: ssn
     params:
-      mode: full            # full = de-identify all 9 digits | last4 = keep the last 4 digits
       output_format: preserve
       realistic: true
 
-  account_number:
+  account_number:           # full / last4 comes from policy.account_number
     type: account_number
-    params:
-      mode: last4           # full = de-identify everything | last4 = keep the last 4 characters
 
   member_no:                # stored as BIGINT in Customers and zero-padded VARCHAR(12) in Accounts
     type: account_number
-    params: {normalize: digits, pad_to: 12, mode: full}
+    params: {normalize: digits, pad_to: 12, mode: full}   # an explicit mode overrides the policy
 
-  card_number:
+  card_number:              # mode comes from policy.credit_card
     type: credit_card
-    params: {mode: first6_last4}   # full | last4 | first6_last4
 
   account_name:             # people -> fake person names; businesses -> fake company names keeping INC/LLC/...
     type: account_name
-    params:
-      method: realistic     # realistic (fake names) | hash (unique code) | redact (constant)
+    params:                 # method (realistic | hash | redact) comes from policy.names
       keep_industry_words: true
       extra_business_words: []
 

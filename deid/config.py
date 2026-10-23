@@ -15,7 +15,7 @@ try:
 except ImportError:  # PyYAML-ft (free-threading build, e.g. some ActiveState runtimes) installs as yaml_ft
     import yaml_ft as yaml
 
-from .maskers import ALGORITHM_VERSION, MaskerError, get_masker_class
+from .maskers import ALGORITHM_VERSION, MODES, NAME_METHODS, MaskerError, get_masker_class
 
 
 class ConfigError(Exception):
@@ -160,6 +160,11 @@ class DomainRule:
     name: str
     type: str
     params: Dict[str, Any] = field(default_factory=dict)
+    #: params filled in from the rules-file policy (not written back as explicit domain params)
+    policy_keys: List[str] = field(default_factory=list)
+
+    def explicit_params(self) -> Dict[str, Any]:
+        return {k: v for k, v in self.params.items() if k not in self.policy_keys}
 
     def signature(self) -> Tuple[str, str]:
         return self.type, json.dumps(self.params, sort_keys=True, default=str)
@@ -206,12 +211,14 @@ class Rules:
     source_path: Optional[Path] = None
     content_hash: str = ""
     algorithm_version: int = ALGORITHM_VERSION
+    policy: Dict[str, str] = field(default_factory=lambda: dict(DEFAULT_POLICY))
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "algorithm_version": self.algorithm_version,
+            "policy": dict(self.policy),
             "domains": {
-                d.name: ({"type": d.type, "params": d.params} if d.params else {"type": d.type})
+                d.name: ({"type": d.type, "params": d.explicit_params()} if d.explicit_params() else {"type": d.type})
                 for d in self.domains.values()
             },
             "tables": [
@@ -245,8 +252,55 @@ def _define_domain(domains: Dict[str, DomainRule], name: str, mtype: str, params
     domains[name] = new
 
 
+# =============================================================================
+# Masking policy: one switch per kind of identifier, at the top of deid_rules.yaml.
+# It applies to every domain of those types that does not set the parameter itself.
+# =============================================================================
+POLICY_OPTIONS: Dict[str, Tuple[Tuple[str, ...], str, Tuple[str, ...], str]] = {
+    # policy key:      (mask types,                     param,    allowed values, question)
+    "ssn":            (("ssn",), "mode", ("full", "last4"), "SSN: de-identify fully, or keep the last 4 digits?"),
+    "account_number": (("account_number",), "mode", ("full", "last4"),
+                       "Account numbers: de-identify fully, or keep the last 4 characters?"),
+    "credit_card":    (("credit_card",), "mode", tuple(MODES),
+                       "Card numbers: full, last4, or first6_last4 (keep BIN + last 4)?"),
+    "names":          (("full_name", "account_name"), "method", tuple(NAME_METHODS),
+                       "Names: realistic (fake names), hash (unique code) or redact (constant)?"),
+}
+DEFAULT_POLICY = {"ssn": "full", "account_number": "full", "credit_card": "full", "names": "realistic"}
+
+
+def _parse_policy(raw: Any, source: str) -> Dict[str, str]:
+    if raw is None:
+        return dict(DEFAULT_POLICY)
+    if not isinstance(raw, dict):
+        raise ConfigError("%s: 'policy' must be a mapping like {ssn: full, account_number: last4}" % source)
+    unknown = set(raw) - set(POLICY_OPTIONS)
+    if unknown:
+        raise ConfigError("%s: unknown policy key(s) %s. Allowed: %s" % (source, sorted(unknown), sorted(POLICY_OPTIONS)))
+    policy = dict(DEFAULT_POLICY)
+    for k, v in raw.items():
+        allowed = POLICY_OPTIONS[k][2]
+        if str(v) not in allowed:
+            raise ConfigError("%s: policy.%s must be one of %s (got %r)" % (source, k, ", ".join(allowed), v))
+        policy[k] = str(v)
+    return policy
+
+
+def _apply_policy(domains: Dict[str, DomainRule], policy: Dict[str, str], source: str) -> None:
+    for key, (types, param, _, _) in POLICY_OPTIONS.items():
+        for d in domains.values():
+            if d.type in types and param not in d.params:
+                d.params[param] = policy[key]
+                d.policy_keys.append(param)
+                try:
+                    get_masker_class(d.type).validate_params(d.params)
+                except MaskerError as exc:
+                    raise ConfigError("%s: policy.%s=%s cannot apply to domain '%s': %s"
+                                      % (source, key, policy[key], d.name, exc))
+
+
 def parse_rules(raw: Dict[str, Any], source: str = "<rules>") -> Rules:
-    unknown = set(raw) - {"domains", "tables", "algorithm_version"}
+    unknown = set(raw) - {"domains", "tables", "algorithm_version", "policy"}
     if unknown:
         raise ConfigError("Unknown top-level key(s) in %s: %s" % (source, sorted(unknown)))
     version = raw.get("algorithm_version", ALGORITHM_VERSION)
@@ -325,14 +379,49 @@ def parse_rules(raw: Dict[str, Any], source: str = "<rules>") -> Rules:
             raise ConfigError("%s: table %s.%s has no columns" % (where, schema, table))
         tables.append(TableRule(schema, table, cols, [str(k) for k in (t.get("key_columns") or [])]))
 
+    policy = _parse_policy(raw.get("policy"), source)
+    _apply_policy(domains, policy, source)
     for d in domains.values():
         for ref in get_masker_class(d.type).referenced_domains(get_masker_class(d.type).validate_params(d.params)):
             if ref not in domains:
                 raise ConfigError("%s: domain '%s' masks free-text hits with domain '%s', which is not defined"
                                   % (source, d.name, ref))
-    rules = Rules(domains=domains, tables=tables)
+    rules = Rules(domains=domains, tables=tables, policy=policy)
     rules.content_hash = rules.compute_hash()
     return rules
+
+
+_POLICY_COMMENTS = {
+    "ssn": "full | last4",
+    "account_number": "full | last4",
+    "credit_card": "full | last4 | first6_last4",
+    "names": "realistic | hash | redact   (full_name and account_name columns)",
+}
+
+
+def update_policy_in_file(path: str, policy: Dict[str, str]) -> None:
+    """Write the policy block into deid_rules.yaml in place, keeping every other line and comment."""
+    p = Path(path)
+    lines = p.read_text(encoding="utf-8").splitlines() if p.exists() else []
+    block = ["policy:                   # masking choices; apply to every domain of these types that does not "
+             "set them itself"]
+    block += ["  %-16s %-14s # %s" % (k + ":", policy[k], _POLICY_COMMENTS[k]) for k in POLICY_OPTIONS]
+    start = next((i for i, ln in enumerate(lines) if ln.split("#")[0].rstrip() == "policy:"), None)
+    if start is not None:
+        end = start + 1
+        while end < len(lines) and (lines[end].startswith((" ", "\t")) or not lines[end].strip()):
+            end += 1
+        while end > start + 1 and not lines[end - 1].strip():
+            end -= 1  # keep blank lines that follow the block
+        lines[start:end] = block
+    else:
+        at = next((i + 1 for i, ln in enumerate(lines) if ln.startswith("algorithm_version")), None)
+        if at is None:
+            at = next((i for i, ln in enumerate(lines) if ln.strip() and not ln.lstrip().startswith("#")), len(lines))
+        lines[at:at] = [""] + block + [""]
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
 
 
 _COLUMN_KEYS = {"name", "domain", "type", "params", "expected_input_type", "output_type", "entity_column"}
