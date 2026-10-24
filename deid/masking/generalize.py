@@ -75,7 +75,6 @@ class DateShiftMasker(BaseMasker):
     #: changes the offset, which comes from the actual date / person, so all layouts stay consistent.
     column_params = frozenset({"birth_date", "day_first"})
     families = ("string", "date")
-    uses_entity = True
 
     @classmethod
     def _check_params(cls, p):

@@ -24,8 +24,6 @@ class BaseMasker:
     injective = False
     #: True if the engine should actively check for output collisions
     collision_check = False
-    #: True if the masker uses a second "entity" value (e.g. person id for date shifting)
-    uses_entity = False
 
     def __init__(self, domain: str, key: bytes, params: Optional[Dict[str, Any]] = None):
         self.domain = domain

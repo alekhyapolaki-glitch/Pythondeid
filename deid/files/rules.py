@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..config import ConfigError, Rules, _read_yaml
-from ..masking import get_masker_class
+from ..masking import MaskerError, get_masker_class
 
 CSV_EXT = {".csv", ".txt", ".tsv"}
 
@@ -75,6 +75,7 @@ def _merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def parse_file_rules(raw: Dict[str, Any], rules: Rules, source: str = "<file_rules>") -> FileRules:
+    """Validate a file_rules mapping: defaults -> file entries -> columns (domains from the DB rules)."""
     unknown = set(raw) - {"defaults", "files"}
     if unknown:
         raise FileRuleError("%s: unknown top-level key(s) %s (expected defaults, files)" % (source, sorted(unknown)))
@@ -82,70 +83,83 @@ def parse_file_rules(raw: Dict[str, Any], rules: Rules, source: str = "<file_rul
     bad = set(defaults) - set(DEFAULTS)
     if bad:
         raise FileRuleError("%s: unknown defaults key(s) %s" % (source, sorted(bad)))
-    out: List[FileRule] = []
-    names = set()
-    for i, f in enumerate(raw.get("files") or []):
-        where = "%s files[%d]" % (source, i)
-        if not isinstance(f, dict) or not f.get("pattern"):
-            raise FileRuleError("%s: each file entry needs a 'pattern' (e.g. customers*.csv)" % where)
-        allowed = {"name", "pattern", "format", "sheets", "columns"} | set(DEFAULTS)
-        extra = set(f) - allowed
-        if extra:
-            raise FileRuleError("%s: unknown key(s) %s. Allowed: %s" % (where, sorted(extra), sorted(allowed)))
-        name = str(f.get("name") or f["pattern"])
-        if name in names:
-            raise FileRuleError("%s: duplicate file entry name '%s'" % (where, name))
-        names.add(name)
-        opts = _merge(defaults, {k: f[k] for k in DEFAULTS if k in f})
-        fmt = str(f.get("format") or "").lower()
-        if fmt not in ("", "csv", "excel"):
-            raise FileRuleError("%s: format must be csv or excel" % where)
-        if opts["on_missing_column"] not in ("error", "warn"):
-            raise FileRuleError("%s: on_missing_column must be error or warn" % where)
-        if opts["on_value_error"] not in ("fail", "blank", "keep"):
-            raise FileRuleError("%s: on_value_error must be fail, blank or keep" % where)
-        if opts["excel"].get("mode") not in ("in_place", "streaming"):
-            raise FileRuleError("%s: excel.mode must be in_place or streaming" % where)
-        if not isinstance(opts["excel"].get("header_row"), int) or opts["excel"]["header_row"] < 1:
-            raise FileRuleError("%s: excel.header_row must be a positive integer" % where)
-        if not isinstance(opts["max_file_mb"], int) or opts["max_file_mb"] < 1:
-            raise FileRuleError("%s: max_file_mb must be a positive integer" % where)
-        if not isinstance(opts["csv"].get("max_field_kb"), int) or opts["csv"]["max_field_kb"] < 1:
-            raise FileRuleError("%s: csv.max_field_kb must be a positive integer" % where)
-        if len(str(opts["csv"].get("delimiter", ","))) != 1:
-            raise FileRuleError("%s: csv.delimiter must be one character (use '\\t' for tab)" % where)
-        cols: List[FileColumn] = []
-        seen = set()
-        for j, c in enumerate(f.get("columns") or []):
-            cw = "%s.columns[%d]" % (where, j)
-            if not isinstance(c, dict) or not c.get("name") or not c.get("domain"):
-                raise FileRuleError("%s: each column needs 'name' (header text) and 'domain'" % cw)
-            if str(c["name"]).strip().lower() in seen:
-                raise FileRuleError("%s: column '%s' listed twice" % (cw, c["name"]))
-            seen.add(str(c["name"]).strip().lower())
-            dom = rules.domains.get(str(c["domain"]))
-            if dom is None:
-                raise FileRuleError("%s: domain '%s' is not defined in %s. File columns use the SAME domains as the "
-                                    "database so values mask identically." % (cw, c["domain"], rules.source_path))
-            cls = get_masker_class(dom.type)
-            overrides = {k: v for k, v in c.items() if k not in ("name", "domain", "entity_column")}
-            bad = set(overrides) - set(cls.column_overridable())
-            if bad:
-                raise FileRuleError("%s: unknown key(s) %s (format overrides allowed for %s: %s)"
-                                    % (cw, sorted(bad), dom.type, sorted(cls.column_overridable()) or "none"))
-            needs_entity = cls.entity_required(dom.params)
-            if needs_entity and not c.get("entity_column"):
-                raise FileRuleError("%s: domain '%s' shifts dates per person; add entity_column (the person id "
-                                    "column in this file)" % (cw, dom.name))
-            cols.append(FileColumn(str(c["name"]).strip(), dom.name, str(c.get("entity_column") or "").strip(),
-                                   overrides))
-        if not cols:
-            raise FileRuleError("%s: no columns configured" % where)
-        out.append(FileRule(name, str(f["pattern"]), cols, fmt, [str(s) for s in (f.get("sheets") or [])],
-                            str(opts["output_suffix"]), opts["max_file_mb"], opts["on_missing_column"],
-                            opts["on_value_error"], dict(opts["csv"]), dict(opts["excel"])))
+    names: set = set()
+    out = [_parse_file_entry(f, "%s files[%d]" % (source, i), defaults, rules, names)
+           for i, f in enumerate(raw.get("files") or [])]
     blob = json.dumps(raw, sort_keys=True, default=str).encode("utf-8")
     return FileRules(out, content_hash=hashlib.sha256(blob).hexdigest()[:16])
+
+
+_FILE_ENTRY_KEYS = {"name", "pattern", "format", "sheets", "columns"} | set(DEFAULTS)
+
+
+def _parse_file_entry(f: Any, where: str, defaults: Dict[str, Any], rules: Rules, names: set) -> FileRule:
+    if not isinstance(f, dict) or not f.get("pattern"):
+        raise FileRuleError("%s: each file entry needs a 'pattern' (e.g. customers*.csv)" % where)
+    extra = set(f) - _FILE_ENTRY_KEYS
+    if extra:
+        raise FileRuleError("%s: unknown key(s) %s. Allowed: %s" % (where, sorted(extra), sorted(_FILE_ENTRY_KEYS)))
+    name = str(f.get("name") or f["pattern"])
+    if name in names:
+        raise FileRuleError("%s: duplicate file entry name '%s'" % (where, name))
+    names.add(name)
+    opts = _merge(defaults, {k: f[k] for k in DEFAULTS if k in f})
+    fmt = str(f.get("format") or "").lower()
+    if fmt not in ("", "csv", "excel"):
+        raise FileRuleError("%s: format must be csv or excel" % where)
+    _check_file_options(opts, where)
+    seen: set = set()
+    cols = [_parse_file_column(c, "%s.columns[%d]" % (where, j), rules, seen)
+            for j, c in enumerate(f.get("columns") or [])]
+    if not cols:
+        raise FileRuleError("%s: no columns configured" % where)
+    return FileRule(name, str(f["pattern"]), cols, fmt, [str(s) for s in (f.get("sheets") or [])],
+                    str(opts["output_suffix"]), opts["max_file_mb"], opts["on_missing_column"],
+                    opts["on_value_error"], dict(opts["csv"]), dict(opts["excel"]))
+
+
+def _check_file_options(opts: Dict[str, Any], where: str) -> None:
+    if opts["on_missing_column"] not in ("error", "warn"):
+        raise FileRuleError("%s: on_missing_column must be error or warn" % where)
+    if opts["on_value_error"] not in ("fail", "blank", "keep"):
+        raise FileRuleError("%s: on_value_error must be fail, blank or keep" % where)
+    if opts["excel"].get("mode") not in ("in_place", "streaming"):
+        raise FileRuleError("%s: excel.mode must be in_place or streaming" % where)
+    if not isinstance(opts["excel"].get("header_row"), int) or opts["excel"]["header_row"] < 1:
+        raise FileRuleError("%s: excel.header_row must be a positive integer" % where)
+    if not isinstance(opts["max_file_mb"], int) or opts["max_file_mb"] < 1:
+        raise FileRuleError("%s: max_file_mb must be a positive integer" % where)
+    if not isinstance(opts["csv"].get("max_field_kb"), int) or opts["csv"]["max_field_kb"] < 1:
+        raise FileRuleError("%s: csv.max_field_kb must be a positive integer" % where)
+    if len(str(opts["csv"].get("delimiter", ","))) != 1:
+        raise FileRuleError("%s: csv.delimiter must be one character (use '\\t' for tab)" % where)
+
+
+def _parse_file_column(c: Any, cw: str, rules: Rules, seen: set) -> FileColumn:
+    if not isinstance(c, dict) or not c.get("name") or not c.get("domain"):
+        raise FileRuleError("%s: each column needs 'name' (header text) and 'domain'" % cw)
+    if str(c["name"]).strip().lower() in seen:
+        raise FileRuleError("%s: column '%s' listed twice" % (cw, c["name"]))
+    seen.add(str(c["name"]).strip().lower())
+    dom = rules.domains.get(str(c["domain"]))
+    if dom is None:
+        raise FileRuleError("%s: domain '%s' is not defined in %s. File columns use the SAME domains as the "
+                            "database so values mask identically." % (cw, c["domain"], rules.source_path))
+    cls = get_masker_class(dom.type)
+    overrides = {k: v for k, v in c.items() if k not in ("name", "domain", "entity_column")}
+    bad = set(overrides) - set(cls.column_overridable())
+    if bad:
+        raise FileRuleError("%s: unknown key(s) %s (per-column settings for %s: %s)"
+                            % (cw, sorted(bad), dom.type, sorted(cls.column_overridable()) or "none"))
+    if overrides:  # values too, not just names (e.g. method: scramble fails here, not mid-run)
+        try:
+            cls.validate_params(dict(dom.params, **overrides))
+        except MaskerError as exc:
+            raise FileRuleError("%s: %s" % (cw, exc)) from exc
+    if cls.entity_required(dom.params) and not c.get("entity_column"):
+        raise FileRuleError("%s: domain '%s' shifts dates per person; add entity_column (the person id "
+                            "column in this file)" % (cw, dom.name))
+    return FileColumn(str(c["name"]).strip(), dom.name, str(c.get("entity_column") or "").strip(), overrides)
 
 
 def load_file_rules(path: str, rules: Rules) -> FileRules:

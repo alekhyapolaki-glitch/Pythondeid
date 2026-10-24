@@ -106,7 +106,6 @@ class IndexInfo:
     name: str
     columns: List[str]
     is_primary_key: bool = False
-    is_unique_constraint: bool = False
     is_clustered: bool = False
     is_disabled: bool = False
     referenced_by_fk: bool = False
@@ -161,7 +160,6 @@ class ForeignKey:
     column_pairs: List[Tuple[str, str]]  # (child column, parent column)
     update_action: int = 0               # 0 = NO ACTION, 1 = CASCADE, 2 = SET NULL, 3 = SET DEFAULT
     is_disabled: bool = False
-    is_not_trusted: bool = False
 
     @property
     def child_fqn(self) -> str:
@@ -232,7 +230,7 @@ class SchemaCatalog:
 
         cur.execute(
             """
-            SELECT s.name, t.name, i.name, i.is_primary_key, c.name, i.is_unique_constraint, i.type, i.is_disabled,
+            SELECT s.name, t.name, i.name, i.is_primary_key, c.name, i.type, i.is_disabled,
                    CASE WHEN EXISTS (SELECT 1 FROM sys.foreign_keys fk WHERE fk.referenced_object_id = i.object_id
                                      AND fk.key_index_id = i.index_id) THEN 1 ELSE 0 END
             FROM sys.indexes i
@@ -244,10 +242,10 @@ class SchemaCatalog:
             ORDER BY s.name, t.name, i.index_id, ic.key_ordinal"""
         )
         sets: Dict[Tuple[str, str, str], IndexInfo] = {}
-        for schema, table, index, is_pk, col, is_uc, itype, is_dis, ref in cur.fetchall():
+        for schema, table, index, is_pk, col, itype, is_dis, ref in cur.fetchall():
             ix = sets.get((schema, table, index))
             if ix is None:
-                ix = IndexInfo(index, [], bool(is_pk), bool(is_uc), int(itype) == 1, bool(is_dis), bool(ref))
+                ix = IndexInfo(index, [], bool(is_pk), int(itype) == 1, bool(is_dis), bool(ref))
                 sets[(schema, table, index)] = ix
             ix.columns.append(col)
         for (schema, table, _), ix in sets.items():
@@ -280,7 +278,7 @@ class SchemaCatalog:
         cur.execute(
             """
             SELECT fk.name, cs.name, ct.name, cc.name, ps.name, pt.name, pc.name,
-                   fk.update_referential_action, fk.is_disabled, fk.is_not_trusted, fkc.constraint_column_id
+                   fk.update_referential_action, fk.is_disabled, fkc.constraint_column_id
             FROM sys.foreign_keys fk
             JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id
             JOIN sys.tables ct ON ct.object_id = fk.parent_object_id
@@ -292,10 +290,10 @@ class SchemaCatalog:
             ORDER BY fk.name, fkc.constraint_column_id"""
         )
         fks: Dict[Tuple[str, str], ForeignKey] = {}
-        for name, cs, ct, cc, ps, pt, pc, upd, dis, untrusted, _ in cur.fetchall():
+        for name, cs, ct, cc, ps, pt, pc, upd, dis, _ in cur.fetchall():
             fk = fks.get((cs, name))
             if fk is None:
-                fk = ForeignKey(name, cs, ct, ps, pt, [], int(upd), bool(dis), bool(untrusted))
+                fk = ForeignKey(name, cs, ct, ps, pt, [], int(upd), bool(dis))
                 fks[(cs, name)] = fk
             fk.column_pairs.append((cc, pc))
         cat.foreign_keys = list(fks.values())

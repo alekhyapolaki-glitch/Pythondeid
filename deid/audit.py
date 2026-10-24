@@ -43,7 +43,6 @@ def _now() -> _dt.datetime:
 
 class AuditTrail:
     def __init__(self, audit_settings: Dict[str, Any], run_id: str, conn=None):
-        self.cfg = audit_settings
         self.run_id = run_id
         self.conn = conn if audit_settings.get("write_to_db", True) else None
         self.schema = audit_settings.get("schema", "deid_audit")

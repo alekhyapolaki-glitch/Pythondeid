@@ -44,7 +44,6 @@ class RunLocked(PlanError):
 @dataclass
 class ColumnStats:
     distinct_before: int = 0
-    non_null_before: int = 0
     distinct_after: Optional[int] = None
     collisions: int = 0
     truncated: int = 0
@@ -290,8 +289,6 @@ class Engine:
                  ", batch=%d" % tp.batch_size if tp.strategy == "chunked" else "")
         counts = self._counts(tp)
         stats = self._build_map(tp, write=not dry_run)
-        for cp in tp.columns:
-            stats[cp.ordinal].non_null_before = counts[cp.ordinal]
 
         problems = ["%s: %s" % (cp.name, e) for cp in tp.columns for e in stats[cp.ordinal].errors]
         if problems:
@@ -363,74 +360,83 @@ class Engine:
             yield [tuple(r) for r in rows]
 
     def _build_map(self, tp: TablePlan, write: bool) -> Dict[int, ColumnStats]:
+        """Mask every distinct value of each column and (when writing) load the results into #deid_map."""
         stats = {cp.ordinal: ColumnStats() for cp in tp.columns}
-        fetch = int(self.ex.get("fetch_size", 20000))
-        cap = int(self.ex.get("collision_check_max_values", 5000000))
-        parallel = self.workers > 1 and tp.info.row_count >= PARALLEL_MIN_ROWS
         ins = None
         if write:
             self.work.cursor().execute(MAP_DDL)
-            ins = self.work.cursor()
-            ins.fast_executemany = True
+            ins = self._map_insert_cursor()
+        parallel = self.workers > 1 and tp.info.row_count >= PARALLEL_MIN_ROWS
         for cp in tp.columns:
-            if cp.is_nullify:
-                continue
-            masker = self._col_masker(tp, cp)
-            st = stats[cp.ordinal]
-            check = bool(self.ex.get("collision_check", True) and masker.collision_check)
-            seen = self._collisions.setdefault(cp.domain.name, {}) if check else None
-            truncate = cp.domain.type == "free_text" and masker.params.get("on_overflow") == "truncate"
-            targets = [cp.info] + ([cp.output_info] if cp.output_info is not None else [])
-            rcur = self.read.cursor()
-            rcur.execute(distinct_values_sql(tp, cp))
-            for _, results in self.pool.map(masker, cp.overrides, self._fetch_batches(rcur, fetch), check, parallel):
-                batch = []
-                for h, masked, err, digest in results:
-                    st.distinct_before += 1
-                    if err is None and truncate and masked is not None:
-                        limit = min([c.max_chars for c in targets if c.max_chars and c.max_chars > 0] or [0])
-                        if limit and len(masked) > limit:
-                            masked = masked[:limit]
-                            st.truncated += 1
-                    if err is None:
-                        err = next((e for e in (check_fits(c, masked) for c in targets) if e), None)
-                    if err:
-                        if len(st.errors) < MAX_REPORTED_ERRORS:
-                            st.errors.append(err)
-                        continue
-                    if seen is not None and masked is not None and cp.domain.name not in self._collision_capped:
-                        prior = seen.get(masked)
-                        if prior is None:
-                            if len(seen) >= cap:
-                                self._collision_capped.add(cp.domain.name)
-                                log.warning("Collision check for domain '%s' covered the first %d values (cap "
-                                            "execution.collision_check_max_values)", cp.domain.name, cap)
-                            else:
-                                seen[masked] = digest
-                        elif prior != digest:
-                            st.collisions += 1
-                            if len(st.errors) < MAX_REPORTED_ERRORS:
-                                st.errors.append("collision: two different values mask to the same output in domain "
-                                                 "'%s' (increase token_length)" % cp.domain.name)
-                    batch.append((cp.ordinal, h, masked))
-                if write and batch and not st.errors:
-                    self._insert_map(ins, batch)
-            if st.truncated:
-                log.info("%s.%s: %d free-text value(s) truncated to fit the column", tp.fqn, cp.name, st.truncated)
-            log.debug("%s.%s: %d distinct values mapped", tp.fqn, cp.name, st.distinct_before)
+            if not cp.is_nullify:  # nullify needs no map: the UPDATE sets NULL directly
+                self._map_column(tp, cp, stats[cp.ordinal], ins, parallel)
         if write:
             self.work.commit()
         return stats
 
-    @staticmethod
-    def _insert_map(cur, batch) -> None:
+    def _map_column(self, tp: TablePlan, cp: ColumnPlan, st: ColumnStats, ins, parallel: bool) -> None:
+        masker = self._col_masker(tp, cp)
+        check = bool(self.ex.get("collision_check", True) and masker.collision_check)
+        seen = self._collisions.setdefault(cp.domain.name, {}) if check else None
+        targets = [cp.info] + ([cp.output_info] if cp.output_info is not None else [])
+        truncate_to = 0  # free text may be cut to the narrowest target column (on_overflow: truncate)
+        if cp.domain.type == "free_text" and masker.params.get("on_overflow") == "truncate":
+            truncate_to = min([c.max_chars for c in targets if c.max_chars and c.max_chars > 0] or [0])
+        rcur = self.read.cursor()
+        rcur.execute(distinct_values_sql(tp, cp))
+        batches = self._fetch_batches(rcur, int(self.ex.get("fetch_size", 20000)))
+        for _, results in self.pool.map(masker, cp.overrides, batches, check, parallel):
+            batch = []
+            for h, masked, err, digest in results:
+                st.distinct_before += 1
+                if err is None:
+                    if truncate_to and masked is not None and len(masked) > truncate_to:
+                        masked = masked[:truncate_to]
+                        st.truncated += 1
+                    err = next((e for e in (check_fits(c, masked) for c in targets) if e), None)
+                if err:
+                    if len(st.errors) < MAX_REPORTED_ERRORS:
+                        st.errors.append(err)
+                    continue
+                if seen is not None and masked is not None:
+                    self._check_collision(cp, seen, masked, digest, st)
+                batch.append((cp.ordinal, h, masked))
+            if ins is not None and batch and not st.errors:
+                ins.executemany("INSERT INTO #deid_map (col_ord, h, masked) VALUES (?, ?, ?)", batch)
+        if st.truncated:
+            log.info("%s.%s: %d free-text value(s) truncated to fit the column", tp.fqn, cp.name, st.truncated)
+        log.debug("%s.%s: %d distinct values mapped", tp.fqn, cp.name, st.distinct_before)
+
+    def _check_collision(self, cp: ColumnPlan, seen: Dict[str, bytes], masked: str, digest, st: ColumnStats) -> None:
+        """Two different inputs must never share a masked value in a domain that claims uniqueness."""
+        if cp.domain.name in self._collision_capped:
+            return
+        prior = seen.get(masked)
+        if prior is None:
+            cap = int(self.ex.get("collision_check_max_values", 5000000))
+            if len(seen) >= cap:
+                self._collision_capped.add(cp.domain.name)
+                log.warning("Collision check for domain '%s' covered the first %d values (cap "
+                            "execution.collision_check_max_values)", cp.domain.name, cap)
+            else:
+                seen[masked] = digest
+        elif prior != digest:
+            st.collisions += 1
+            if len(st.errors) < MAX_REPORTED_ERRORS:
+                st.errors.append("collision: two different values mask to the same output in domain "
+                                 "'%s' (increase token_length)" % cp.domain.name)
+
+    def _map_insert_cursor(self):
+        """Cursor for bulk inserts into #deid_map: fast_executemany with fixed parameter types (set once)."""
+        cur = self.work.cursor()
+        cur.fast_executemany = True
         try:
             import pyodbc
             cur.setinputsizes([(pyodbc.SQL_INTEGER, 0, 0), (pyodbc.SQL_VARBINARY, 32, 0),
                                (pyodbc.SQL_WVARCHAR, MAP_MASKED_MAX, 0)])
-        except (ImportError, AttributeError):  # pragma: no cover
+        except (ImportError, AttributeError):  # pragma: no cover - pyodbc missing / older version
             pass
-        cur.executemany("INSERT INTO #deid_map (col_ord, h, masked) VALUES (?, ?, ?)", batch)
+        return cur
 
     def _drop_map(self) -> None:
         try:

@@ -117,6 +117,24 @@ def _define_domain(domains: Dict[str, DomainRule], name: str, mtype: str, params
 
 
 def parse_rules(raw: Dict[str, Any], source: str = "<rules>", profile: Optional[Profile] = None) -> Rules:
+    """Validate a deid_rules mapping: header -> domains -> tables/columns -> policy (+ profile)."""
+    _check_header(raw, source)
+    domains = _parse_domains(raw, source)
+    tables: List[TableRule] = []
+    seen_tables: set = set()
+    for i, t in enumerate(raw.get("tables") or []):
+        tables.append(_parse_table(t, "%s tables[%d]" % (source, i), domains, seen_tables))
+    policy = _parse_policy(raw.get("policy"), source)
+    if profile is not None:
+        policy.update(profile.policy)  # the profile decides for its audience
+    _apply_policy(domains, policy, source + (" (profile %s)" % profile.name if profile else ""))
+    _check_free_text_references(domains, source)
+    rules = Rules(domains=domains, tables=tables, policy=policy, profile=profile.name if profile else "")
+    rules.content_hash = rules.compute_hash()
+    return rules
+
+
+def _check_header(raw: Dict[str, Any], source: str) -> None:
     unknown = set(raw) - {"domains", "tables", "algorithm_version", "policy"}
     if unknown:
         raise ConfigError("Unknown top-level key(s) in %s: %s" % (source, sorted(unknown)))
@@ -125,6 +143,9 @@ def parse_rules(raw: Dict[str, Any], source: str = "<rules>", profile: Optional[
         raise ConfigError(
             "%s pins algorithm_version %s but this tool implements version %s. Every server must run the same "
             "algorithm version or masked values will differ." % (source, version, ALGORITHM_VERSION))
+
+
+def _parse_domains(raw: Dict[str, Any], source: str) -> Dict[str, DomainRule]:
     domains: Dict[str, DomainRule] = {}
     for name, spec in (raw.get("domains") or {}).items():
         if isinstance(spec, str):
@@ -135,79 +156,82 @@ def parse_rules(raw: Dict[str, Any], source: str = "<rules>", profile: Optional[
         if extra:
             raise ConfigError("%s: domain '%s' has unknown key(s) %s" % (source, name, sorted(extra)))
         _define_domain(domains, str(name), spec["type"], spec.get("params") or {}, "%s domain '%s'" % (source, name))
+    return domains
 
-    tables: List[TableRule] = []
-    seen_tables = set()
-    for i, t in enumerate(raw.get("tables") or []):
-        where = "%s tables[%d]" % (source, i)
-        if not isinstance(t, dict) or "table" not in t:
-            raise ConfigError("%s: each table needs 'table' (and optional 'schema')" % where)
-        schema = str(t.get("schema") or "dbo")
-        table = str(t["table"])
-        key = (schema.lower(), table.lower())
-        if key in seen_tables:
-            raise ConfigError("%s: table %s.%s listed twice" % (where, schema, table))
-        seen_tables.add(key)
-        cols: List[ColumnRule] = []
-        seen_cols = set()
-        for j, c in enumerate(t.get("columns") or []):
-            cw = "%s.columns[%d]" % (where, j)
-            if isinstance(c, str):
-                c = {"name": c}
-            if not isinstance(c, dict) or "name" not in c:
-                raise ConfigError("%s: column entries need a 'name'" % cw)
-            if c["name"].lower() in seen_cols:
-                raise ConfigError("%s: column %s listed twice" % (cw, c["name"]))
-            seen_cols.add(c["name"].lower())
-            if c.get("type"):
-                dname = str(c.get("domain") or c["type"])
-                _define_domain(domains, dname, c["type"], c.get("params") or {}, cw)
-            elif c.get("domain"):
-                dname = str(c["domain"])
-                if dname not in domains:
-                    # Allow referencing a mask type directly as a domain with default params.
-                    _define_domain(domains, dname, dname, {}, cw + " (domain '%s' not defined; treated as a mask type)" % dname)
-            else:
-                raise ConfigError("%s: column '%s' needs a 'domain' or a 'type'" % (cw, c["name"]))
-            extra = set(c) - _COLUMN_KEYS
-            dom = domains[dname]
-            fmt_allowed = get_masker_class(dom.type).column_overridable()
-            bad = extra - set(fmt_allowed)
-            if bad:
-                raise ConfigError("%s: unknown key(s) %s for column '%s'. Column-level keys: %s; per-column "
-                                  "settings for %s: %s" % (cw, sorted(bad), c["name"], sorted(_COLUMN_KEYS), dom.type,
-                                                           sorted(fmt_allowed) or "none"))
-            overrides = {k: c[k] for k in extra}
-            if overrides:
-                try:
-                    get_masker_class(dom.type).validate_params(dict(dom.params, **overrides))
-                except MaskerError as exc:
-                    raise ConfigError("%s: %s" % (cw, exc)) from exc
-            entity = str(c.get("entity_column") or "")
-            needs_entity = get_masker_class(dom.type).entity_required(get_masker_class(dom.type).validate_params(dom.params))
-            if needs_entity and not entity:
-                raise ConfigError("%s: domain '%s' uses shift_by: entity, so column '%s' needs entity_column "
-                                  "(the person id column in this table)" % (cw, dname, c["name"]))
-            if entity and not needs_entity:
-                raise ConfigError("%s: entity_column is only valid for date_shift domains with shift_by: entity" % cw)
-            cols.append(ColumnRule(str(c["name"]), dname, str(c.get("expected_input_type") or ""),
-                                   str(c.get("output_type") or ""), overrides, entity))
-        if not cols:
-            raise ConfigError("%s: table %s.%s has no columns" % (where, schema, table))
-        tables.append(TableRule(schema, table, cols, [str(k) for k in (t.get("key_columns") or [])]))
 
-    policy = _parse_policy(raw.get("policy"), source)
-    if profile is not None:
-        policy.update(profile.policy)  # the profile decides for its audience
-    _apply_policy(domains, policy, source + (" (profile %s)" % profile.name if profile else ""))
+def _parse_table(t: Any, where: str, domains: Dict[str, DomainRule], seen_tables: set) -> TableRule:
+    if not isinstance(t, dict) or "table" not in t:
+        raise ConfigError("%s: each table needs 'table' (and optional 'schema')" % where)
+    schema = str(t.get("schema") or "dbo")
+    table = str(t["table"])
+    key = (schema.lower(), table.lower())
+    if key in seen_tables:
+        raise ConfigError("%s: table %s.%s listed twice" % (where, schema, table))
+    seen_tables.add(key)
+    seen_cols: set = set()
+    cols = [_parse_column(c, "%s.columns[%d]" % (where, j), domains, seen_cols)
+            for j, c in enumerate(t.get("columns") or [])]
+    if not cols:
+        raise ConfigError("%s: table %s.%s has no columns" % (where, schema, table))
+    return TableRule(schema, table, cols, [str(k) for k in (t.get("key_columns") or [])])
+
+
+def _parse_column(c: Any, cw: str, domains: Dict[str, DomainRule], seen_cols: set) -> ColumnRule:
+    if isinstance(c, str):
+        c = {"name": c}
+    if not isinstance(c, dict) or "name" not in c:
+        raise ConfigError("%s: column entries need a 'name'" % cw)
+    if c["name"].lower() in seen_cols:
+        raise ConfigError("%s: column %s listed twice" % (cw, c["name"]))
+    seen_cols.add(c["name"].lower())
+    dname = _column_domain(c, cw, domains)
+    dom = domains[dname]
+    cls = get_masker_class(dom.type)
+    extra = set(c) - _COLUMN_KEYS
+    fmt_allowed = cls.column_overridable()
+    bad = extra - set(fmt_allowed)
+    if bad:
+        raise ConfigError("%s: unknown key(s) %s for column '%s'. Column-level keys: %s; per-column "
+                          "settings for %s: %s" % (cw, sorted(bad), c["name"], sorted(_COLUMN_KEYS), dom.type,
+                                                   sorted(fmt_allowed) or "none"))
+    overrides = {k: c[k] for k in extra}
+    if overrides:
+        try:
+            cls.validate_params(dict(dom.params, **overrides))
+        except MaskerError as exc:
+            raise ConfigError("%s: %s" % (cw, exc)) from exc
+    entity = str(c.get("entity_column") or "")
+    needs_entity = cls.entity_required(cls.validate_params(dom.params))
+    if needs_entity and not entity:
+        raise ConfigError("%s: domain '%s' uses shift_by: entity, so column '%s' needs entity_column "
+                          "(the person id column in this table)" % (cw, dname, c["name"]))
+    if entity and not needs_entity:
+        raise ConfigError("%s: entity_column is only valid for date_shift domains with shift_by: entity" % cw)
+    return ColumnRule(str(c["name"]), dname, str(c.get("expected_input_type") or ""),
+                      str(c.get("output_type") or ""), overrides, entity)
+
+
+def _column_domain(c: Dict[str, Any], cw: str, domains: Dict[str, DomainRule]) -> str:
+    """The column's domain: inline type (+params), a named domain, or a mask type used as a domain."""
+    if c.get("type"):
+        dname = str(c.get("domain") or c["type"])
+        _define_domain(domains, dname, c["type"], c.get("params") or {}, cw)
+        return dname
+    if c.get("domain"):
+        dname = str(c["domain"])
+        if dname not in domains:
+            # Allow referencing a mask type directly as a domain with default params.
+            _define_domain(domains, dname, dname, {}, cw + " (domain '%s' not defined; treated as a mask type)" % dname)
+        return dname
+    raise ConfigError("%s: column '%s' needs a 'domain' or a 'type'" % (cw, c["name"]))
+
+
+def _check_free_text_references(domains: Dict[str, DomainRule], source: str) -> None:
     for d in domains.values():
         for ref in get_masker_class(d.type).referenced_domains(get_masker_class(d.type).validate_params(d.params)):
             if ref not in domains:
                 raise ConfigError("%s: domain '%s' masks free-text hits with domain '%s', which is not defined"
                                   % (source, d.name, ref))
-    rules = Rules(domains=domains, tables=tables, policy=policy, profile=profile.name if profile else "")
-    rules.content_hash = rules.compute_hash()
-    return rules
 
 
 _COLUMN_KEYS = {"name", "domain", "type", "params", "expected_input_type", "output_type", "entity_column"}
