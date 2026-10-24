@@ -8,6 +8,7 @@
 It (re)creates the DeidDemo database from sql/sample_schema.sql.
 """
 
+import datetime as dt
 import os
 import re
 from pathlib import Path
@@ -106,6 +107,13 @@ def test_end_to_end_preserves_integrity(demo_db):
             assert e1 != e0 and e1.endswith("@example.com")
         if s0 is not None:
             assert s1 != s0 and len(s1) == len(s0)
+    # dates stay dates: column types unchanged and values come back as date/datetime objects
+    types = dict(_query(settings, "SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE COLUMN_NAME IN "
+                                  "('DateOfBirth', 'AdmitDate', 'TxnDate')"))
+    assert types == {"DateOfBirth": "date", "AdmitDate": "datetime2", "TxnDate": "datetime"}
+    dob, admit = _query(settings, "SELECT TOP 1 c.DateOfBirth, v.AdmitDate FROM dbo.Customers c "
+                                  "JOIN dbo.Visits v ON v.CustomerId = c.CustomerId")[0]
+    assert isinstance(dob, dt.date) and isinstance(admit, dt.datetime)
     notes = _query(settings, "SELECT Notes FROM dbo.Visits WHERE VisitId IN (1, 2) ORDER BY VisitId")
     assert "John.Doe" not in notes[0][0] and "[PHONE]" in notes[0][0] and "123-45-6789" not in notes[1][0]
     assert _query(settings, "SELECT is_disabled FROM sys.indexes WHERE name = 'UX_Customers_SSN'") == [(False,)]

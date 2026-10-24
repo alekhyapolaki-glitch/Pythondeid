@@ -6,6 +6,7 @@ import datetime as _dt
 import re
 
 from .base import BaseMasker, MaskerError, _choice, _non_negative_int
+from .dates import parse_date_text
 from .fpe import FeistelCipher, encrypt_text
 
 
@@ -55,15 +56,6 @@ class ZipMasker(BaseMasker):
         return "".join(out)
 
 
-_DATE_ISO = re.compile(r"^(\s*)(\d{4})-(\d{2})-(\d{2})(.*)$", re.S)
-
-
-_DATE_US = re.compile(r"^(\s*)(\d{1,2})/(\d{1,2})/(\d{4})(.*)$", re.S)
-
-
-_DATE_COMPACT = re.compile(r"^(\s*)(\d{4})(\d{2})(\d{2})(\s*)$")
-
-
 def normalize_entity(value: str, how: str) -> str:
     if how == "digits":
         d = re.sub(r"\D", "", value)
@@ -78,9 +70,10 @@ class DateShiftMasker(BaseMasker):
     description = ("Shift dates by a deterministic +/- N day offset. shift_by=entity uses ONE offset per person "
                    "(column's entity_column), preserving intervals between that person's dates")
     default_params = {"max_days": 365, "generalize": "none", "shift_by": "value", "entity_normalize": "trim_lower",
-                      "birth_date": False, "reference_year": 0}
-    #: a column marks itself as a birth date; same domain (and per-person offset) as the person's other dates
-    column_params = frozenset({"birth_date"})
+                      "birth_date": False, "reference_year": 0, "day_first": False}
+    #: per column: birth_date (age-90+ grouping) and day_first (text dates written DD/MM/YYYY).  Neither
+    #: changes the offset, which comes from the actual date / person, so all layouts stay consistent.
+    column_params = frozenset({"birth_date", "day_first"})
     families = ("string", "date")
     uses_entity = True
 
@@ -91,8 +84,9 @@ class DateShiftMasker(BaseMasker):
         _choice(p, "generalize", ("none", "year", "month"))
         _choice(p, "shift_by", ("value", "entity"))
         _choice(p, "entity_normalize", ("none", "trim_lower", "digits"))
-        if not isinstance(p["birth_date"], bool):
-            raise MaskerError("date_shift.birth_date must be true or false")
+        for flag in ("birth_date", "day_first"):
+            if not isinstance(p[flag], bool):
+                raise MaskerError("date_shift.%s must be true or false" % flag)
         if not isinstance(p["reference_year"], int) or p["reference_year"] < 0:
             raise MaskerError("date_shift.reference_year must be 0 (current year) or a year")
 
@@ -101,23 +95,11 @@ class DateShiftMasker(BaseMasker):
         return params.get("shift_by") == "entity"
 
     def _parse(self, value):
-        m = _DATE_ISO.match(value)
-        if m:
-            lead, y, mo, d, rest = m.groups()
-            return lead, _dt.date(int(y), int(mo), int(d)), rest, "iso"
-        m = _DATE_US.match(value)
-        if m:
-            lead, mo, d, y, rest = m.groups()
-            return lead, _dt.date(int(y), int(mo), int(d)), rest, "us"
-        m = _DATE_COMPACT.match(value)
-        if m:
-            lead, y, mo, d, rest = m.groups()
-            return lead, _dt.date(int(y), int(mo), int(d)), rest, "compact"
-        raise MaskerError("Unrecognised date format: expected YYYY-MM-DD, MM/DD/YYYY or YYYYMMDD")
+        return parse_date_text(value, self.params["day_first"])
 
     def canonical(self, value):
         try:
-            return self._parse(value)[1].isoformat()
+            return self._parse(value)[0].isoformat()
         except (MaskerError, ValueError):
             return value
 
@@ -132,7 +114,7 @@ class DateShiftMasker(BaseMasker):
         if value.strip() == "":
             return value
         try:
-            lead, date, rest, style = self._parse(value)
+            date, rest, render = self._parse(value)
         except MaskerError:
             raise
         except ValueError as exc:
@@ -161,13 +143,7 @@ class DateShiftMasker(BaseMasker):
                 new = date - _dt.timedelta(days=offset)
         if gen != "none":
             rest = re.sub(r"\d", "0", rest) if rest.strip() else rest
-        if style == "iso":
-            body = new.isoformat()
-        elif style == "us":
-            body = "%02d/%02d/%04d" % (new.month, new.day, new.year)
-        else:
-            body = new.strftime("%Y%m%d")
-        return lead + body + rest
+        return render(new) + rest  # same layout as the input (separators, padding, month names, time)
 
 
 class RedactMasker(BaseMasker):

@@ -350,7 +350,11 @@ class FileDeidentifier:
             wb.close()
 
     def _excel_streaming(self, openpyxl, src, dst, rule, res, hr) -> None:
-        """Values only (no formatting) - for very large workbooks."""
+        """Values plus number formats (dates stay dates in their display format) - for very large workbooks.
+
+        Fonts, fills, column widths and formulas' cached results are not copied; use mode in_place for those.
+        """
+        from openpyxl.cell import WriteOnlyCell
         wb_in = openpyxl.load_workbook(src, read_only=True)
         wb_out = openpyxl.Workbook(write_only=True) if dst else None
         try:
@@ -360,8 +364,8 @@ class FileDeidentifier:
                 targets = []
                 where = "%s [%s]" % (src.name, name)
                 res.sheets.append(name)
-                for r_idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
-                    values = list(row)
+                for r_idx, row in enumerate(ws.iter_rows(), start=1):
+                    values = [c.value for c in row]
                     if r_idx == hr:
                         targets = self._resolve_columns(values, rule, where, res)
                     elif r_idx > hr and targets:
@@ -369,7 +373,16 @@ class FileDeidentifier:
                                              "%s row %d" % (where, r_idx))
                         res.rows += 1
                     if ws_out is not None:
-                        ws_out.append(values)
+                        out_row = []
+                        for cell, value in zip(row, values):
+                            fmt = getattr(cell, "number_format", "General")
+                            if value is not None and fmt and fmt != "General":
+                                oc = WriteOnlyCell(ws_out, value=value)
+                                oc.number_format = fmt  # keeps dates/amounts displayed as before
+                                out_row.append(oc)
+                            else:
+                                out_row.append(value)
+                        ws_out.append(out_row)
             if wb_out is not None:
                 wb_out.save(dst)
         finally:

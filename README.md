@@ -220,6 +220,22 @@ events are preserved, while the actual dates are hidden. The tool reads the pers
 masking, in the same statement, even if that column is masked too. Rows with a NULL person id fall
 back to the per-value shift. Time of day is kept.
 
+### Dates stay dates, in their format
+
+* **SQL Server** `date`, `datetime`, `datetime2`, `smalldatetime` and `datetimeoffset` columns keep
+  their type. Time of day and the timezone offset are kept.
+* **Excel** date cells stay date cells with their display format (`mm/dd/yyyy`, `yyyy-mm-dd hh:mm`,
+  …), in both `in_place` and `streaming` mode.
+* **Dates stored as text** (CSV, `varchar`) come back in the same layout: separators, zero padding,
+  month names and their case, time, AM/PM. Supported layouts:
+  * `1980-04-12`, `1980/04/12`, `1980.4.12`, `19800412`
+  * `04/12/1980`, `4/2/1980`, `04-12-1980`
+  * `12-Apr-1980`, `12 APRIL 1980`, `Apr 12 1980`, `April 12, 1980`
+
+  Set `day_first: true` on a column whose text dates are written DD/MM/YYYY.
+* The same date gets the same shift whatever its layout, so values still match across tables and
+  files. An unrecognised value stops the run with a clear error (nothing is half-masked).
+
 ## 5. Free text (notes, comments)
 
 ```yaml
