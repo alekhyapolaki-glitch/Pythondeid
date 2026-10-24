@@ -96,37 +96,60 @@ def cmd_run(args):
         if not plan.ok:
             print("\nFix the errors above (python main.py validate) before running.")
             return 2
-        if not args.resume:
-            # Any earlier masking run (whatever rules or profile) means the data is already masked.
-            prior = [r for r in engine.previous_runs() if r["mode"] == "run" and r["status"] != "FAILED"]
-            if prior and not args.force:
-                r = prior[0]
-                print("\nRun %s (status %s, %s) already masked this database. Masking masked data again would "
-                      "break consistency." % (r["run_id"], r["status"], r["started_at"]))
-                if r["status"] in ("PARTIAL", "RUNNING"):
-                    print("Resume it with: python main.py run --resume %s" % r["run_id"])
-                print("Use --force only on a freshly restored copy.")
-                return 3
-        if not args.yes:
-            print("\nTarget: server=%s database=%s login=%s" % (info["server"], info["database"], info["login"]))
-            print("This UPDATES data in place and cannot be undone.")
-            if not prompts.ask_yes_no("Is this a NON-production copy and do you have a verified backup?", False):
-                print("Aborted.")
-                return 1
-            dry = _last_dry_run(settings, rules, info)
-            if dry:
-                print("Found passing dry-run %s for these rules." % dry)
-            elif not prompts.ask_yes_no("No passing dry-run found for these rules/database. Continue anyway?", False):
-                print("Run 'python main.py dry-run' first.")
-                return 1
-            if not prompts.confirm_phrase("Final confirmation.", info["database"]):
-                print("Aborted.")
-                return 1
+        if plan.mode == "in_place" and not args.resume and _already_masked(engine, args):
+            return 3
+        if not args.yes and not _confirm(settings, rules, info, plan):
+            return 1
         result = engine.execute(plan, dry_run=False, info=info, resume_from=args.resume)
         _print_result(result)
         return 0 if result["status"] == "SUCCEEDED" else 2
     finally:
         engine.close()
+
+
+def _already_masked(engine, args) -> bool:
+    """In place: any earlier masking run (whatever rules or profile) means the data is already masked."""
+    prior = [r for r in engine.previous_runs() if r["mode"] == "run" and r["status"] != "FAILED"]
+    if not prior or args.force:
+        return False
+    r = prior[0]
+    print("\nRun %s (status %s, %s) already masked this database. Masking masked data again would "
+          "break consistency." % (r["run_id"], r["status"], r["started_at"]))
+    if r["status"] in ("PARTIAL", "RUNNING"):
+        print("Resume it with: python main.py run --resume %s" % r["run_id"])
+    print("Use --force only on a freshly restored copy.")
+    return True
+
+
+def _confirm(settings, rules, info, plan) -> bool:
+    if plan.mode == "on_the_fly":
+        t = info["target"]
+        print("\nSource (only read): server=%s database=%s login=%s" % (info["server"], info["database"], info["login"]))
+        print("Target (written):   server=%s database=%s login=%s" % (t["server"], t["database"], t["login"]))
+        busy = sum(1 for tp in plan.tables if tp.target is not None and tp.target.existing_rows)
+        print("%d target table(s) are emptied and reloaded with masked data%s." % (
+            len(plan.tables), " (%d of them have rows now)" % busy if busy else ""))
+        if not prompts.ask_yes_no("Is the TARGET a non-production database?", False):
+            print("Aborted.")
+            return False
+        phrase = t["database"]
+    else:
+        print("\nTarget: server=%s database=%s login=%s" % (info["server"], info["database"], info["login"]))
+        print("This UPDATES data in place and cannot be undone.")
+        if not prompts.ask_yes_no("Is this a NON-production copy and do you have a verified backup?", False):
+            print("Aborted.")
+            return False
+        phrase = info["database"]
+    dry = _last_dry_run(settings, rules, info)
+    if dry:
+        print("Found passing dry-run %s for these rules." % dry)
+    elif not prompts.ask_yes_no("No passing dry-run found for these rules/database. Continue anyway?", False):
+        print("Run 'python main.py dry-run' first.")
+        return False
+    if not prompts.confirm_phrase("Final confirmation.", phrase):
+        print("Aborted.")
+        return False
+    return True
 
 
 def cmd_audit_report(args):

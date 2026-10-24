@@ -25,3 +25,11 @@ connections:
     driver: ODBC Driver 18 for SQL Server
     encrypt: true
     trust_server_certificate: true
+
+  lower_env:                            # on-the-fly masking target (copy_map.yaml target_connection)
+    server: SQLSERVER03                 # same server as the source -> fast set-based copy
+    database: MyDb_Masked               # schema pre-created by the DBA; its tables are emptied and reloaded
+    auth: windows
+    driver: ODBC Driver 18 for SQL Server
+    encrypt: true
+    trust_server_certificate: true

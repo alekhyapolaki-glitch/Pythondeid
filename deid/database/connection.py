@@ -24,6 +24,11 @@ def _pyodbc():
         raise DatabaseError(
             "pyodbc is not installed in this runtime. With the ActiveState State Tool run: state install pyodbc"
         ) from exc
+    # No ODBC connection pooling: a pooled connection that was used with autocommit off can come back
+    # still inside a transaction although it is reopened with autocommit on (its locks and writes would
+    # then hang or be lost).  The tool keeps a few long-lived connections, so pooling gains nothing.
+    # Must be set before the first connection of the process.
+    pyodbc.pooling = False
     return pyodbc
 
 
@@ -128,12 +133,13 @@ def server_info(conn) -> Dict[str, Any]:
     cur = conn.cursor()
     cur.execute(
         "SELECT @@SERVERNAME, DB_NAME(), SUSER_SNAME(), CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128)), "
-        "CAST(SERVERPROPERTY('Edition') AS NVARCHAR(128)), HOST_NAME()"
+        "CAST(SERVERPROPERTY('Edition') AS NVARCHAR(128)), HOST_NAME(), CAST(SERVERPROPERTY('ServerName') AS NVARCHAR(256))"
     )
     row = cur.fetchone()
     return {
         "server": row[0], "database": row[1], "login": row[2],
         "version": row[3], "edition": row[4], "client_host": row[5],
+        "instance": row[6] or row[0],   # machine\instance as the server itself reports it
     }
 
 

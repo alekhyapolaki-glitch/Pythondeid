@@ -9,6 +9,8 @@ from pathlib import Path
 from ..config import (
     PROJECT_ROOT,
     ConfigError,
+    load_connections,
+    load_copy_map,
     load_rules,
     load_settings,
 )
@@ -57,10 +59,28 @@ def _setup_logging(settings, name="deid"):
     return setup_logging(settings.logging.get("level", "INFO"), settings.logging.get("dir", "logs"), name)
 
 
+def _mode(args, settings) -> str:
+    """in_place (UPDATE the database) or on_the_fly (read source, mask, write target): --mode, else settings."""
+    return getattr(args, "mode", None) or settings.execution.get("mode", "in_place")
+
+
 def _engine(args, settings, rules):
-    from deid.engine import Engine
+    from deid.engine import CopyEngine, Engine
     factory = ConnectionFactory(settings.database, interactive=not args.yes)
-    return Engine(settings, rules, _keyring(settings), factory)
+    if _mode(args, settings) != "on_the_fly":
+        return Engine(settings, rules, _keyring(settings), factory)
+    copy_map = load_copy_map(settings.paths["copy_map"], rules)
+    name = getattr(args, "target_connection", None) or copy_map.target_connection
+    if not name:
+        raise ConfigError("On-the-fly masking needs a target: set target_connection in %s or pass "
+                          "--target-connection NAME (a connection in %s)" % (settings.paths["copy_map"], args.connections))
+    if not (args.connections and Path(args.connections).exists()):
+        raise ConfigError("Target connection '%s' needs %s; add it with: python main.py configure" % (name, args.connections))
+    _, conns = load_connections(args.connections)
+    if name not in conns:
+        raise ConfigError("Target connection '%s' is not in %s (available: %s)" % (name, args.connections, ", ".join(conns)))
+    target = ConnectionFactory(conns[name], interactive=not args.yes)
+    return CopyEngine(settings, rules, _keyring(settings), factory, target, copy_map, name)
 
 
 def _rules(args, settings=None):
@@ -86,7 +106,7 @@ def _plan(args):
 def _print_result(result):
     print("\nRun %s finished: %s" % (result["run_id"], result["status"]))
     print("  tables completed: %d / %d" % (result["tables_completed"], result["tables"]))
-    print("  rows updated:     %d" % result["rows_updated"])
+    print("  rows written:     %d" % result["rows_updated"])
     for f in result["failures"]:
         print("  FAILURE: %s" % f)
     print("  audit files:      %s" % result["audit_dir"])

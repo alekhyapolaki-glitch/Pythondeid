@@ -8,6 +8,17 @@ A refresh masks a freshly restored copy of production, unattended:
 [3] Extracts / delivery to vendors            (Stonebranch tasks; run ONLY if [2] exited with 0)
 ```
 
+**On-the-fly variant** (`execution.mode: on_the_fly`, target in `config/copy_map.yaml`):
+
+```
+[1] Restore prod backup (or create a database snapshot) as the SOURCE   (separate step)
+[2] pythondeid --mode on_the_fly refresh --profile <internal|external>  (source read, target reloaded)
+[3] Extracts / delivery                                                (only if [2] exited with 0)
+```
+
+The source is never changed, so the ALREADY_MASKED check (exit 3) does not apply: every refresh
+empties and reloads the target. LOCKED (exit 7) refers to the target database.
+
 `refresh` never prompts. It reports its outcome as an **exit code**, a final stdout line
 `DEID_RESULT status=... exit_code=... run_id=... result_file=...`, and a **JSON result file**
 (`run_results_dir` in `paths.yaml`, plus `latest_<profile>.json`).

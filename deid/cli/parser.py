@@ -49,6 +49,10 @@ def build_parser():
     p.add_argument("--paths", default=DEFAULT_PATHS, help="file locations YAML (default config/paths.yaml)")
     p.add_argument("--rules", help="rules YAML (default: rules_file in paths.yaml)")
     p.add_argument("-p", "--profile", help="masking profile from config/profiles (e.g. internal, external)")
+    p.add_argument("--mode", choices=("in_place", "on_the_fly"),
+                   help="in_place = UPDATE the database; on_the_fly = read it, mask, write a target "
+                        "(default: execution.mode in settings.yaml)")
+    p.add_argument("--target-connection", help="on_the_fly: target connection name (default: copy_map.yaml)")
     p.add_argument("--server", help="override database.server")
     p.add_argument("--database", help="override database.database")
     p.add_argument("-y", "--yes", action="store_true", help="non-interactive: no questions (use with care)")
@@ -85,7 +89,7 @@ def build_parser():
     rf.add_argument("--result-file", help="JSON result path (default: run_results_dir in paths.yaml)")
     rf.set_defaults(func=cmd_refresh)
 
-    r = sub.add_parser("run", help="de-identify the database in place")
+    r = sub.add_parser("run", help="de-identify: in place, or on the fly into a target (--mode)")
     r.add_argument("--resume", metavar="RUN_ID", help="continue an interrupted/partial run")
     r.add_argument("--force", action="store_true", help="allow re-running rules already applied")
     r.set_defaults(func=cmd_run)

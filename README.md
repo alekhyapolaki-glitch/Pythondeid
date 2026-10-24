@@ -1,7 +1,8 @@
 # pythondeid: SQL Server de-identification with referential integrity
 
 A Python tool, built to run on an **ActiveState** Python runtime, that masks PII in SQL Server
-databases **in place**. A given input value always produces the same masked value in every
+databases, either **in place** (UPDATE) or **on the fly** (read the source, mask, write a target).
+A given input value always produces the same masked value in every
 table, database and server that uses the same secret key and rules, so joins and foreign keys
 keep working after masking. It is built for SQL Server 2022 and large tables.
 
@@ -16,6 +17,7 @@ keep working after masking. It is built for SQL Server 2022 and large tables.
 | Free-text options | `free_text` with `mode: scrub \| redact \| nullify \| hash` and per-detector actions |
 | Big tables | `batch_size: auto` sized per table, parallel masking workers, unique-index handling, DB readiness checks |
 | Update SQL Server, ask questions, audit | `run` with confirmations, `configure`/`wizard`, `deid_audit.*` tables + `audit/<run_id>/` files |
+| In-place or on-the-fly masking | `execution.mode: in_place \| on_the_fly` (or `--mode`); target and column mapping in `config/copy_map.yaml` |
 
 ## Configuration files
 
@@ -26,6 +28,7 @@ keep working after masking. It is built for SQL Server 2022 and large tables.
 | `config/settings.yaml` | **How it runs**: batching, workers, key fingerprint, audit options, log level | Yes | Yes |
 | `config/deid_rules.yaml` | **What to mask**: policy, domains, tables | Yes, must be identical | Yes |
 | `config/file_rules.yaml` | **CSV/Excel files**: which files/sheets/columns, mapped to the same domains | Yes | Yes |
+| `config/copy_map.yaml` | **On-the-fly target**: target connection, target tables, column mapping | Per target | Yes |
 
 * Secrets are in **no** file: the masking key is `DEID_SECRET_KEY`, and SQL passwords go in the
   variable named by each connection's `password_env`.
@@ -34,6 +37,58 @@ keep working after masking. It is built for SQL Server 2022 and large tables.
 * Pick a connection per command: `python main.py -c uat validate`. Without `-c`, the default is used.
 * Relative paths in `paths.yaml` are relative to the project folder, so commands work from any
   directory.
+
+---
+
+## Two masking modes: in place or on the fly
+
+| | `in_place` (default) | `on_the_fly` |
+|---|---|---|
+| What changes | The database itself (UPDATE) | Only the **target**; the source is only read |
+| Typical use | A restored copy that becomes the masked database | Prod copy / snapshot -> masked lower environment |
+| Target | (itself) | Other table in the same database, other database on the same server, or another server |
+| Masked values | Deterministic per domain and key | **Identical** to in place (same rules, key and algorithms; proven by the tests) |
+| Re-run | Blocked once masked (`--force` only on a fresh restore) | Reloads the target every time (`on_existing_rows: truncate`) |
+
+Choose the mode in `settings.yaml` (`execution.mode`) or per command with `--mode`:
+
+```bat
+python main.py --mode on_the_fly --target-connection lower_env validate
+python main.py --mode on_the_fly --target-connection lower_env dry-run
+python main.py --mode on_the_fly --target-connection lower_env run
+```
+
+**Which tables:** the tables in `deid_rules.yaml`, each masked column with its domain. Other columns
+are copied as they are. **Where they go:** `config/copy_map.yaml`. By default each table goes to the
+same `schema.table` in the target; list a table there to give it another target name, pick its
+columns (`columns: [...]`) or map column names (`column_map: {Email: EmailAddress}`).
+
+How a table is copied (all optimizations of in-place masking are kept):
+
+1. The mask map is built exactly as in place: distinct values only, parallel workers, collision and
+   fit checks (against the **target** column), in the source session's tempdb.
+2. The target table is emptied (TRUNCATE, or batched DELETE when a foreign key references it). Its
+   triggers and nonclustered indexes are disabled; target foreign keys are set to NOCHECK.
+3. Rows are loaded in key-range batches (`batch_size: auto`), each committed with its resume
+   checkpoint:
+   * **set_based** (same SQL Server instance): `INSERT ... WITH (TABLOCK) SELECT ... JOIN #deid_map`
+     inside SQL Server. Rows never leave the server; minimal logging where the recovery model allows.
+   * **stream** (another server): the source returns rows that are **already masked**; a reader
+     thread fetches the next batch while the target connection writes the current one
+     (`fast_executemany`). Dates/times travel as exact ISO text; large values are streamed.
+4. Checks: source and target row counts must match; indexes are rebuilt; FKs are re-enabled
+   `WITH CHECK` once every table is loaded, which proves the copy is referentially intact.
+
+Safety: a value missing from the mask map (a row added to the source during the copy) makes the
+statement **fail** instead of copying the original value. The target can't be the source table, a
+NOT NULL target column must be written or have a default, and a target table that isn't copied but
+references a reloaded one must be empty. For a consistent copy, read from a restored backup or a
+database snapshot (`CREATE DATABASE ... AS SNAPSHOT OF ...`), not a busy production database.
+
+Permissions: the source login needs only `SELECT` (plus tempdb, which every login has). The target
+login needs `db_owner` on the target (TRUNCATE, ALTER for indexes/triggers/FKs, the `deid_audit`
+schema). For set-based copies the source login also needs INSERT (and ALTER for IDENTITY values) on
+the target tables; without it, `transfer: auto` streams instead and says so in the plan.
 
 ---
 
@@ -411,6 +466,7 @@ config/                         CONFIGURATION (no code, no secrets)
   settings.yaml                   how the tool runs
   deid_rules.yaml                 what to mask in the database: policy, domains, tables
   file_rules.yaml                 what to mask in CSV/Excel files
+  copy_map.yaml                   on-the-fly masking: target connection, target tables, column mapping
 deid/                           APPLICATION CODE, one responsibility per module
   cli/                            command-line layer (parsing and user interaction only)
     parser.py                       argument parser + routing
@@ -420,7 +476,7 @@ deid/                           APPLICATION CODE, one responsibility per module
     file_commands.py                files-discover, files-validate, files-run
     tool_commands.py                preview, list-types, test-vectors
   config/                         loading + validation of each config file
-    base.py, connections.py, paths.py, settings.py, rules.py, policy.py
+    base.py, connections.py, paths.py, settings.py, rules.py, policy.py, copy_map.py
   masking/                        masking algorithms (no I/O, no database)
     keys.py                         secret key, per-domain keys, fingerprint
     base.py                         BaseMasker, MaskerError, shared helpers
@@ -444,6 +500,9 @@ deid/                           APPLICATION CODE, one responsibility per module
     validation.py                   masked value fits the column?
     executor.py                     runs the plan: map, update, constraints, checkpoints, audit
     parallel.py                     multi-process masking
+    copy_plan.py                    on the fly: maps tables/columns onto the target, checks it is ready
+    copy_sql.py                     on the fly: masked SELECT (with fail-safe) and INSERT statements
+    copier.py                       on the fly: empty, load (set-based or streamed), verify the target
   files/                          CSV / Excel de-identification
     rules.py                        file_rules.yaml model and validation
     processor.py                    reading/writing files, value cache, parallel pre-masking
@@ -527,6 +586,9 @@ databases** and assert that every masked value is identical.
 
 * Requires SQL Server 2016 or later (built and tested on 2022). Masked values over 4000
   characters aren't supported.
+* On the fly: target tables must be created beforehand (same structure). `sql_variant` columns
+  can only be copied inside one instance (set-based). Copying from a database that changes during
+  the copy stops with an error (fail-safe and row-count check): use a restored copy or a snapshot.
 * Changing a domain's name, type or identity parameters (e.g. `mode`) changes its masks. Keep the
   rules file under version control and identical on every server.
 * Regex free-text scrubbing doesn't detect names or other PII written in prose.

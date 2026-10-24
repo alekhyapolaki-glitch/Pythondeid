@@ -101,12 +101,15 @@ def _run_database(args, settings, rules, result: Dict[str, Any]) -> None:
         except DatabaseError as exc:
             raise _Outcome("CONNECTION_ERROR", str(exc)) from None
         result.update(server=info["server"], database=info["database"], login=info["login"])
+        if "target" in info:
+            result["target"] = info["target"]
         plan = engine.plan()
+        result["mode"] = plan.mode
         _step(result, "validate", ok=plan.ok, errors=plan.errors[:20], warnings=len(plan.warnings),
               tables=len(plan.tables))
         if not plan.ok:
             raise _Outcome("INVALID", "plan has %d error(s): %s" % (len(plan.errors), "; ".join(plan.errors[:3])))
-        if not args.resume:
+        if not args.resume and plan.mode == "in_place":   # on the fly reloads the target every time
             prior = [r for r in engine.previous_runs() if r["mode"] == "run" and r["status"] != "FAILED"]
             if prior and not args.force:
                 raise _Outcome("ALREADY_MASKED", "database %s was already masked by run %s (%s); restore a fresh "

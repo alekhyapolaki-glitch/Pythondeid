@@ -89,6 +89,20 @@ contain input values.
 * Each batch commits together with its checkpoint, so `--resume` continues without masking any
   row twice. Any committed change marks the run `PARTIAL`, never `FAILED`.
 
+### On-the-fly masking
+
+* The source is only read; nothing is written to it (not even audit tables). Only the target is
+  changed, so the target connection must point at a non-production database: `run` shows both and
+  asks for the target database name as confirmation.
+* Unmasked values never reach the target: masked columns are taken from the mask map, and a value
+  missing from it fails the statement instead of being copied. Streamed rows are masked by the
+  source session, so original values of masked columns don't cross the network to the target.
+* Refused before anything is written: target equals the source table, NOT NULL target columns that
+  nothing writes, target tables that aren't copied but reference a reloaded table and have rows.
+* After a complete load the target's FKs are validated `WITH CHECK` and its indexes rebuilt. After a
+  failed load the FKs are re-enabled without validation (untrusted); a re-run or `--resume`
+  validates them.
+
 ## Operator checklist (production)
 
 1. Run only against a **restored, non-production copy**, with a verified backup.

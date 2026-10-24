@@ -32,6 +32,7 @@ class ColumnInfo:
     is_computed: bool = False
     is_identity: bool = False
     column_id: int = 0
+    has_default: bool = False
 
     @property
     def family(self) -> str:
@@ -208,8 +209,9 @@ class SchemaCatalog:
 
         cur.execute(
             """
-            SELECT s.name, t.name, c.name, TYPE_NAME(c.system_type_id), c.max_length, c.precision, c.scale,
-                   c.is_nullable, c.is_computed, c.is_identity, c.column_id
+            SELECT s.name, t.name, c.name, COALESCE(TYPE_NAME(c.system_type_id), TYPE_NAME(c.user_type_id)), c.max_length, c.precision, c.scale,
+                   c.is_nullable, c.is_computed, c.is_identity, c.column_id,
+                   CASE WHEN c.default_object_id <> 0 THEN 1 ELSE 0 END
             FROM sys.tables t
             JOIN sys.schemas s ON s.schema_id = t.schema_id
             JOIN sys.columns c ON c.object_id = t.object_id
@@ -225,7 +227,7 @@ class SchemaCatalog:
                 cat.add_table(t)
             t.columns[row[2].lower()] = ColumnInfo(
                 row[0], row[1], row[2], row[3], int(row[4]), int(row[5]), int(row[6]),
-                bool(row[7]), bool(row[8]), bool(row[9]), int(row[10]),
+                bool(row[7]), bool(row[8]), bool(row[9]), int(row[10]), bool(row[11]),
             )
 
         cur.execute(
@@ -334,3 +336,18 @@ def index_disabled(conn, schema: str, table: str, index: str) -> bool:
     )
     row = cur.fetchone()
     return bool(row[0]) if row else False
+
+
+def nonclustered_indexes(conn, schema: str, table: str) -> List[str]:
+    """Enabled nonclustered (rowstore and columnstore) indexes that can be disabled for a bulk load:
+    not a primary key and not the unique index a foreign key references."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT i.name FROM sys.indexes i JOIN sys.tables t ON t.object_id = i.object_id "
+        "JOIN sys.schemas s ON s.schema_id = t.schema_id "
+        "WHERE s.name = ? AND t.name = ? AND i.type IN (2, 6) AND i.is_disabled = 0 AND i.is_primary_key = 0 "
+        "AND i.is_hypothetical = 0 AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys fk "
+        "WHERE fk.referenced_object_id = i.object_id AND fk.key_index_id = i.index_id) ORDER BY i.index_id",
+        [schema, table],
+    )
+    return [r[0] for r in cur.fetchall()]

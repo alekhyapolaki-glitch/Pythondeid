@@ -11,6 +11,8 @@ security:
   expected_key_fingerprint: ''               # pin it: python main.py key-fingerprint (refuses a different key)
 
 execution:
+  mode: in_place                   # in_place = UPDATE the database itself
+                                   # on_the_fly = read the source, mask, write a target (copy_map.yaml)
   batch_size: auto                 # rows per committed chunk, or auto = sized per table (see batching)
   fetch_size: 20000                # distinct values per round trip when building the mask map
   workers: auto                    # masking processes for big tables: auto = CPUs - 1 (max 8), or a number

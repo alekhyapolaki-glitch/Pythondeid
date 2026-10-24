@@ -18,3 +18,6 @@ file_output_dir: data/output                  # de-identified copies: <name>_dei
 # --- profiles and scheduled runs
 profiles_dir: config/profiles                 # masking profiles: internal.yaml, external.yaml, ...
 run_results_dir: audit/results               # refresh writes <run>.json here for the scheduler (Stonebranch)
+
+# --- on-the-fly masking (execution.mode: on_the_fly)
+copy_map: config/copy_map.yaml               # target connection, target tables and column mapping

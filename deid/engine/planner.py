@@ -28,10 +28,17 @@ class ColumnPlan:
     output_info: Optional[ColumnInfo] = None
     overrides: Dict[str, Any] = field(default_factory=dict)
     expected_input_type: str = ""
+    #: on-the-fly masking: the column the masked value is written to (None = in place)
+    target_info: Optional[ColumnInfo] = None
 
     @property
     def name(self) -> str:
         return self.info.name
+
+    @property
+    def fit_targets(self) -> List[ColumnInfo]:
+        """Columns every masked value must fit: where it is written (+ the rule's output_type)."""
+        return [self.target_info or self.info] + ([self.output_info] if self.output_info is not None else [])
 
     @property
     def is_nullify(self) -> bool:
@@ -47,6 +54,8 @@ class TablePlan:
     batch_size: int = 0
     disable_indexes: List[IndexInfo] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
+    #: on-the-fly masking: where and how the table is written (copy_plan.CopyTarget)
+    target: Optional[Any] = None
 
     @property
     def fqn(self) -> str:
@@ -67,14 +76,19 @@ class Plan:
     foreign_keys: List[ForeignKey]
     warnings: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
+    mode: str = "in_place"
+    #: on-the-fly masking: target connection, transfer method, target FKs (copy_plan.CopySetup)
+    copy: Optional[Any] = None
 
     @property
     def ok(self) -> bool:
         return not self.errors
 
     def describe(self) -> str:
-        lines = ["De-identification plan: %d table(s), %d column(s)" % (
-            len(self.tables), sum(len(t.columns) for t in self.tables))]
+        lines = ["De-identification plan (%s): %d table(s), %d masked column(s)" % (
+            self.mode, len(self.tables), sum(len(t.columns) for t in self.tables))]
+        if self.copy is not None:
+            lines.extend(self.copy.header_lines())
         for tp in self.tables:
             size_mb = tp.info.data_bytes / 1048576.0
             if tp.strategy == "chunked":
@@ -82,30 +96,16 @@ class Plan:
                 how = "chunked, %d rows/batch (~%d batches)" % (tp.batch_size, chunks)
             else:
                 how = "single transaction, ~%d MB log" % estimate_log_mb(tp.info)
-            lines.append("  %s  [~%d rows, %.1f MB, %s, key=%s]" % (
-                tp.fqn, tp.info.row_count, size_mb, how, ",".join(tp.key_columns) or "-"))
-            for cp in tp.columns:
-                extra = []
-                if cp.auto_added:
-                    extra.append("auto-added via FK")
-                if cp.entity_info is not None:
-                    extra.append("per-person shift by %s" % cp.entity_info.name)
-                if cp.output_info is not None:
-                    extra.append("output_type %s" % cp.output_info.type_display())
-                effective = dict(cp.domain.params, **cp.overrides)  # what this column will actually use
-                for k in ("method", "mode"):
-                    if k in effective:
-                        extra.append("%s=%s%s" % (k, effective[k], " (this column)" if k in cp.overrides else ""))
-                other = {k: v for k, v in cp.overrides.items() if k not in ("method", "mode")}
-                if other:
-                    extra.append(", ".join("%s=%s" % kv for kv in other.items()))
-                lines.append("      - %-30s %-16s -> domain '%s' (%s)%s" % (
-                    cp.name, cp.info.type_display(), cp.domain.name, cp.domain.type,
-                    ("  [%s]" % "; ".join(extra)) if extra else ""))
+            lines.append("  %s%s  [~%d rows, %.1f MB, %s, key=%s]" % (
+                tp.fqn, (" -> %s" % tp.target.describe()) if tp.target is not None else "",
+                tp.info.row_count, size_mb, how, ",".join(tp.key_columns) or "-"))
+            lines.extend(_column_line(cp) for cp in tp.columns)
             for ix in tp.disable_indexes:
                 lines.append("      note: unique index %s disabled during update, rebuilt afterwards" % ix.name)
             for n in tp.notes:
                 lines.append("      note: %s" % n)
+            if tp.target is not None:
+                lines.extend(tp.target.detail_lines())
         if self.foreign_keys:
             lines.append("  Foreign keys toggled during the run:")
             for fk in self.foreign_keys:
@@ -116,6 +116,28 @@ class Plan:
         for e in self.errors:
             lines.append("ERROR:   " + e)
         return "\n".join(lines)
+
+
+def _column_line(cp: ColumnPlan) -> str:
+    extra = []
+    if cp.auto_added:
+        extra.append("auto-added via FK")
+    if cp.entity_info is not None:
+        extra.append("per-person shift by %s" % cp.entity_info.name)
+    if cp.target_info is not None and cp.target_info.name != cp.name:
+        extra.append("written to %s" % cp.target_info.name)
+    if cp.output_info is not None:
+        extra.append("output_type %s" % cp.output_info.type_display())
+    effective = dict(cp.domain.params, **cp.overrides)  # what this column will actually use
+    for k in ("method", "mode"):
+        if k in effective:
+            extra.append("%s=%s%s" % (k, effective[k], " (this column)" if k in cp.overrides else ""))
+    other = {k: v for k, v in cp.overrides.items() if k not in ("method", "mode")}
+    if other:
+        extra.append(", ".join("%s=%s" % kv for kv in other.items()))
+    return "      - %-30s %-16s -> domain '%s' (%s)%s" % (
+        cp.name, cp.info.type_display(), cp.domain.name, cp.domain.type,
+        ("  [%s]" % "; ".join(extra)) if extra else "")
 
 
 def _identity_overrides(rule: Optional[ColumnRule], domain: str, rules: Rules) -> Dict[str, Any]:
@@ -131,16 +153,23 @@ _Targets = Dict[Tuple[str, str], Dict[str, Tuple[str, bool, Optional[ColumnRule]
 
 
 def build_plan(catalog: SchemaCatalog, rules: Rules, execution: Dict[str, Any], chunking_available: bool,
-               batching: Optional[Dict[str, Any]] = None) -> Plan:
-    """Validate the rules against the live schema and decide how each table is updated."""
-    return _Planner(catalog, rules, execution, chunking_available, batching or {}).build()
+               batching: Optional[Dict[str, Any]] = None, mode: str = "in_place") -> Plan:
+    """Validate the rules against the live (source) schema and decide how each table is processed.
+
+    mode=on_the_fly: the source is only read, so update-only checks (cascading FKs, unique indexes on
+    masked columns, masked chunk keys) do not apply, and FK partners are only masked when their table
+    is copied too; copy_plan then maps every table onto the target.
+    """
+    return _Planner(catalog, rules, execution, chunking_available, batching or {}, mode).build()
 
 
 class _Planner:
     """One planning run. Steps: resolve targets -> FK closure -> per-column checks -> key + strategy."""
 
-    def __init__(self, catalog, rules, execution, chunking_available, batching):
+    def __init__(self, catalog, rules, execution, chunking_available, batching, mode="in_place"):
         self.catalog, self.rules, self.execution = catalog, rules, execution
+        self.mode = mode
+        self.copy_mode = mode == "on_the_fly"
         self.chunking_available, self.batching = chunking_available, batching
         self.errors: List[str] = []
         self.warnings: List[str] = []
@@ -155,7 +184,9 @@ class _Planner:
         self._close_over_foreign_keys()
         tables = [self._plan_table(k) for k in self.order]
         self._warn_mixed_type_domains()
-        return Plan(tables, list(self.fks.values()), self.warnings, self.errors)
+        # on the fly, the source FKs are never touched (copy_plan toggles the target's)
+        fks = [] if self.copy_mode else list(self.fks.values())
+        return Plan(tables, fks, self.warnings, self.errors, self.mode)
 
     # ---- step 1: tables and columns named in the rules ----------------------
     def _resolve_targets(self) -> None:
@@ -182,7 +213,7 @@ class _Planner:
             domain, _, src_rule = self.targets[(s, t)][c]
             for fk, _side, os_, ot, oc in self.catalog.fks_touching(s, t, c):
                 self.fks[(fk.schema.lower(), fk.name.lower())] = fk
-                if fk.update_action == 1:
+                if fk.update_action == 1 and not self.copy_mode:
                     self.errors.append(
                         "FK %s (%s -> %s) is ON UPDATE CASCADE on masked column %s; cascading would double-mask the "
                         "child. Change the FK to NO ACTION for the masking run." % (fk.name, fk.child_fqn, fk.parent_fqn, c))
@@ -190,6 +221,8 @@ class _Planner:
                 other = self.targets.get(other_key, {}).get(oc.lower())
                 if other is not None:
                     self._check_fk_pair(fk, (s, t, c), (os_, ot, oc), domain, src_rule, other)
+                elif self.copy_mode and other_key not in self.targets:
+                    continue  # that table is not copied, so its values are never written anywhere
                 elif self.execution.get("auto_include_fk_columns", True) and self.catalog.get(os_, ot) is not None:
                     self._auto_add_partner(fk, (s, t, c), (os_, ot, oc), domain, src_rule)
                     queue.append((other_key, oc.lower()))
@@ -315,12 +348,12 @@ class _Planner:
             reasons.append("audit.write_to_db is off (checkpoints need it)")
         if len(tp.key_columns) != 1:
             reasons.append("no single-column key" if not tp.key_columns else "composite key")
-        elif tp.key_columns[0].lower() in masked:
-            reasons.append("key column is masked")
+        elif tp.key_columns[0].lower() in masked and not self.copy_mode:
+            reasons.append("key column is masked")  # on the fly the key is only read from the source
         elif tp.key_info.family not in ("int", "string"):
             reasons.append("key type %s not supported for chunking" % tp.key_info.data_type)
         blocking, disable = [], []
-        for c in tp.columns:
+        for c in ([] if self.copy_mode else tp.columns):  # the source's own indexes matter only in place
             for ix in ti.unique_indexes_on(c.name):
                 if ix.can_disable and self.execution.get("disable_unique_indexes", True):
                     if ix not in disable:
@@ -331,12 +364,13 @@ class _Planner:
             reasons.append("masked column(s) %s are in a PK/clustered/FK-referenced unique index" % ", ".join(blocking))
         if reasons:
             tp.strategy = "single"
-            tp.notes.append("single-statement update: " + "; ".join(reasons))
+            verb = "copied" if self.copy_mode else "updated"
+            tp.notes.append("single-statement %s: %s" % ("copy" if self.copy_mode else "update", "; ".join(reasons)))
             if ti.row_count > self.execution.get("allow_single_statement_rows", 50000000):
                 self.warnings.append(
-                    "%s has ~%d rows and will be updated in ONE transaction (~%d MB log) because %s. "
-                    "Make sure the log can hold it, or provide an unmasked key_columns."
-                    % (ti.fqn, ti.row_count, estimate_log_mb(ti), "; ".join(reasons)))
+                    "%s has ~%d rows and will be %s in ONE transaction (~%d MB log) because %s. "
+                    "Make sure the log can hold it, or provide key_columns."
+                    % (ti.fqn, ti.row_count, verb, estimate_log_mb(ti), "; ".join(reasons)))
         else:
             tp.strategy = "chunked"
             tp.disable_indexes = disable

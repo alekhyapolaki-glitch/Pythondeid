@@ -4,6 +4,7 @@
     paths.yaml       -> paths         file and folder locations
     settings.yaml    -> settings      how the tool runs
     deid_rules.yaml  -> rules, policy what to mask (domains, tables, masking policy)
+    copy_map.yaml    -> copy_map      where on-the-fly masking writes (target tables, column mapping)
 """
 
 from .base import PROJECT_ROOT, ConfigError, _deep_merge, _read_yaml, _resolve
@@ -14,6 +15,7 @@ from .connections import (
                           save_connection,
                           validate_connection,
 )
+from .copy_map import CopyMap, TableMapping, load_copy_map, parse_copy_map
 from .paths import DEFAULT_PATHS, load_paths
 from .policy import DEFAULT_POLICY, POLICY_OPTIONS, _parse_policy, update_policy_in_file
 from .profiles import Profile, list_profiles, load_profile
@@ -42,10 +44,12 @@ __all__ = [
                           "SECRET_KEY_ENV_DEFAULT",
                           "ColumnRule",
                           "ConfigError",
+                          "CopyMap",
                           "DomainRule",
                           "Profile",
                           "Rules",
                           "Settings",
+                          "TableMapping",
                           "TableRule",
                           "_deep_merge",
                           "_parse_policy",
@@ -53,10 +57,12 @@ __all__ = [
                           "_resolve",
                           "list_profiles",
                           "load_connections",
+                          "load_copy_map",
                           "load_paths",
                           "load_profile",
                           "load_rules",
                           "load_settings",
+                          "parse_copy_map",
                           "parse_rules",
                           "rules_from_csv",
                           "save_connection",

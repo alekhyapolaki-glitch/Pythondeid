@@ -56,8 +56,10 @@ class AuditTrail:
     def db_enabled(self) -> bool:
         return self.conn is not None
 
-    def t(self, name: str) -> str:
-        return "%s.%s" % (quote_ident(self.schema), quote_ident(name))
+    def t(self, name: str, database: Optional[str] = None) -> str:
+        """Audit table name; with database, the three-part name (used from another database's session)."""
+        two = "%s.%s" % (quote_ident(self.schema), quote_ident(name))
+        return "%s.%s" % (quote_ident(database), two) if database else two
 
     def ensure_schema(self) -> None:
         if not self.db_enabled:
@@ -96,7 +98,8 @@ class AuditTrail:
             cur.execute("IF OBJECT_ID(N'%s', N'U') IS NULL CREATE TABLE %s (%s)" % (obj, self.t(name), cols))
         # upgrade audit tables created by earlier versions
         for table, col, typ in (("run", "algorithm_version", "INT"), ("column_result", "batch_size", "INT"),
-                                ("run", "profile", "NVARCHAR(64)")):
+                                ("run", "profile", "NVARCHAR(64)"), ("run", "masking_mode", "NVARCHAR(20)"),
+                                ("run", "target_server", "NVARCHAR(256)"), ("run", "target_database", "NVARCHAR(256)")):
             cur.execute("IF COL_LENGTH(N'%s.%s', N'%s') IS NULL ALTER TABLE %s ADD %s %s NULL"
                         % (s, table, col, self.t(table), quote_ident(col), typ))
 
@@ -112,12 +115,14 @@ class AuditTrail:
             self.conn.cursor().execute(
                 "INSERT INTO %s (run_id, mode, status, started_at, server_name, database_name, db_login, os_user, "  # nosec B608
                 "client_host, tool_version, rules_file, rules_hash, key_fingerprint, resumed_from, tables_planned, "
-                "algorithm_version, profile) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)" % self.t("run"),
+                "algorithm_version, profile, masking_mode, target_server, target_database) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)" % self.t("run"),
                 [self.run_id, mode, "RUNNING", _now(), info.get("server"), info.get("database"), info.get("login"),
                  self.summary["os_user"], self.summary["client_host"], info.get("tool_version"),
                  info.get("rules_file"), info.get("rules_hash"), info.get("key_fingerprint"),
                  info.get("resumed_from"), info.get("tables_planned"), info.get("algorithm_version"),
-                 info.get("profile") or None],
+                 info.get("profile") or None, info.get("masking_mode") or "in_place",
+                 (info.get("target") or {}).get("server"), (info.get("target") or {}).get("database")],
             )
         self.event("INFO", "Run started (mode=%s)" % mode)
 
@@ -185,9 +190,10 @@ class AuditTrail:
                             for k in self.FILE_FIELDS})
 
     # ------------------------------------------------------------------ progress / checkpoints
-    def progress_upsert_sql(self) -> str:
-        """SQL executed on the *work* connection so the checkpoint commits atomically with the data."""
-        t = self.t("table_progress")
+    def progress_upsert_sql(self, database: Optional[str] = None) -> str:
+        """SQL executed on the connection that writes the data, so the checkpoint commits atomically with it
+        (database: the audit database seen from another database's session, three-part name)."""
+        t = self.t("table_progress", database)
         return (
             "UPDATE %s SET status=?, last_key=?, rows_updated=rows_updated+?, updated_at=SYSUTCDATETIME() "  # nosec B608
             "WHERE run_id=? AND schema_name=? AND table_name=?; "

@@ -120,7 +120,7 @@ class Engine:
     def previous_runs(self) -> List[Dict[str, Any]]:
         if not self.settings.audit.get("write_to_db", True):
             return []
-        conn = self.factory.connect(autocommit=True)
+        conn = self._audit_factory().connect(autocommit=True)
         try:
             cur = conn.cursor()
             s = self.settings.audit["schema"]
@@ -148,7 +148,7 @@ class Engine:
         if not dry_run:
             self._acquire_lock(info)
         if db_audit:
-            self.audit_conn = self.factory.connect(autocommit=True)
+            self.audit_conn = self._audit_factory().connect(autocommit=True)
         audit = AuditTrail(self.settings.audit, run_id, self.audit_conn if db_audit else None)
         audit.ensure_schema()
         state: Dict[str, Any] = {"run_id": run_id, "fks_disabled": [], "indexes_disabled": []}
@@ -161,7 +161,7 @@ class Engine:
             rules_hash=self.rules.content_hash, key_fingerprint=self.keyring.fingerprint(),
             profile=self.rules.profile, policy=dict(self.rules.policy),
             algorithm_version=ALGORITHM_VERSION, resumed_from=resume_from, tables_planned=len(plan.tables),
-            workers=self.workers,
+            workers=self.workers, masking_mode=plan.mode,
         ))
         for w in plan.warnings:
             audit.event("WARN", w)
@@ -170,7 +170,7 @@ class Engine:
         progress = audit.table_progress(run_id)
         audit.save_state(state)
 
-        self.work = self.factory.connect(autocommit=False)
+        self._open_work(audit, dry_run)
         completed, total_rows, failures = 0, 0, []
         try:
             if not dry_run:
@@ -180,22 +180,46 @@ class Engine:
         finally:
             if not dry_run:
                 failures.extend(self._finish_constraints(completed == len(plan.tables), state, audit, run_id))
-            try:
-                self.work.rollback()
-            except Exception as exc:
-                log.debug("Final rollback failed: %s", exc.__class__.__name__)
+            self._rollback_work()
 
         status = self._final_status(dry_run, failures, completed)
         audit.end_run(status, "; ".join(failures), completed, total_rows)
         return {"run_id": run_id, "status": status, "tables_completed": completed, "tables": len(plan.tables),
                 "rows_updated": total_rows, "failures": failures, "audit_dir": str(audit.dir)}
 
+    # ---- hooks: on-the-fly masking (copier.CopyEngine) writes to a target instead of the source
+    def _audit_factory(self):
+        """Connections to the database that is changed (and holds the audit trail and the run lock)."""
+        return self.factory
+
+    def _written_database(self, info: Dict[str, Any]) -> str:
+        return info.get("database", "")
+
+    @property
+    def _ddl(self):
+        """Connection that toggles constraints of the tables being written."""
+        return self.work
+
+    def _toggle_fks(self, plan: Plan) -> List[Any]:
+        return plan.foreign_keys
+
+    def _open_work(self, audit: AuditTrail, dry_run: bool) -> None:
+        _close_quietly(self.work)   # from an earlier execute() (e.g. the dry run before the run)
+        self.work = self.factory.connect(autocommit=False)
+
+    def _rollback_work(self) -> None:
+        for c in (self.work,):
+            try:
+                c.rollback()
+            except Exception as exc:
+                log.debug("Final rollback failed: %s", exc.__class__.__name__)
+
     def _acquire_lock(self, info: Dict[str, Any]) -> None:
         """One masking run per database at a time (scheduled and manual runs alike)."""
-        self.lock_conn = self.factory.connect(autocommit=True)
-        if not acquire_run_lock(self.lock_conn, "pythondeid:%s" % info.get("database", "")):
-            raise RunLocked("Another masking run is in progress on database %s; try again when it has finished"
-                            % info.get("database"))
+        self.lock_conn = self._audit_factory().connect(autocommit=True)
+        db = self._written_database(info)
+        if not acquire_run_lock(self.lock_conn, "pythondeid:%s" % db):
+            raise RunLocked("Another masking run is in progress on database %s; try again when it has finished" % db)
 
     def _resume_state(self, resume_from: str) -> Dict[str, Any]:
         """Constraints left disabled by the run being resumed; refuses if the rules or key changed."""
@@ -254,14 +278,15 @@ class Engine:
 
     # ------------------------------------------------------------------ constraints
     def _disable_fks(self, plan: Plan, state: Dict[str, Any], audit: AuditTrail) -> None:
-        cur = self.work.cursor()
+        conn = self._ddl
+        cur = conn.cursor()
         known = {(f["schema"].lower(), f["name"].lower()) for f in state["fks_disabled"]}
-        for fk in plan.foreign_keys:
+        for fk in self._toggle_fks(plan):
             if fk.is_disabled or (fk.schema.lower(), fk.name.lower()) in known:
                 # Disabled before this run (left alone) or by the run being resumed (re-enabled at the end).
                 continue
             cur.execute("ALTER TABLE %s NOCHECK CONSTRAINT %s" % (qualified(fk.schema, fk.table), quote_ident(fk.name)))
-            self.work.commit()
+            conn.commit()
             state["fks_disabled"].append({"schema": fk.schema, "table": fk.table, "name": fk.name})
             audit.save_state(state)
             audit.event("INFO", "Disabled FK %s" % fk.name, fk.child_fqn)
@@ -269,20 +294,21 @@ class Engine:
 
     def _enable_fks(self, state: Dict[str, Any], audit: AuditTrail) -> List[str]:
         problems = []
-        cur = self.work.cursor()
+        conn = self._ddl
+        cur = conn.cursor()
         remaining = []
         for f in state["fks_disabled"]:
             target = qualified(f["schema"], f["table"])
             try:
                 cur.execute("ALTER TABLE %s WITH CHECK CHECK CONSTRAINT %s" % (target, quote_ident(f["name"])))
-                self.work.commit()
-                disabled, untrusted = fk_status(self.work, f["schema"], f["name"])
+                conn.commit()
+                disabled, untrusted = fk_status(conn, f["schema"], f["name"])
                 if disabled or untrusted:
                     raise RuntimeError("constraint is still disabled/untrusted")
                 audit.event("INFO", "Re-enabled and validated FK %s (WITH CHECK)" % f["name"], target)
                 log.info("Re-enabled and validated FK %s", f["name"])
             except Exception as exc:
-                self.work.rollback()
+                conn.rollback()
                 remaining.append(f)
                 msg = "FK %s on %s failed validation after masking: %s" % (f["name"], target, exc)
                 problems.append(msg)
@@ -413,7 +439,7 @@ class Engine:
         masker = self._col_masker(tp, cp)
         check = bool(self.ex.get("collision_check", True) and masker.collision_check)
         seen = self._collisions.setdefault(cp.domain.name, {}) if check else None
-        targets = [cp.info] + ([cp.output_info] if cp.output_info is not None else [])
+        targets = cp.fit_targets
         truncate_to = _truncate_limit(cp, masker, targets)
         rcur = self.read.cursor()
         rcur.execute(distinct_values_sql(tp, cp))
@@ -552,6 +578,16 @@ class Engine:
                 "rows_updated": rows, "distinct_after": st.distinct_after, "collisions": st.collisions,
                 "message": note, "started_at": started, "ended_at": _utc(),
             })
+
+
+def _close_quietly(conn) -> None:
+    if conn is None:
+        return
+    try:
+        conn.rollback()
+        conn.close()
+    except Exception as exc:
+        log.debug("Closing a connection failed: %s", exc.__class__.__name__)
 
 
 def _utc():

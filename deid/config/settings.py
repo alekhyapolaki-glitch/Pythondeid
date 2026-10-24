@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from .base import ConfigError, _deep_merge, _read_yaml, _resolve, yaml
+from .copy_map import MODES
 from .connections import DEFAULT_CONNECTION, load_connections, validate_connection
 from .paths import load_paths
 
@@ -18,6 +19,7 @@ SECRET_KEY_ENV_DEFAULT = "DEID_SECRET_KEY"  # noqa: S105  # nosec B105
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "security": {"secret_key_env": SECRET_KEY_ENV_DEFAULT, "min_key_length": 32, "expected_key_fingerprint": ""},
     "execution": {
+        "mode": "in_place",              # in_place = UPDATE the database | on_the_fly = read, mask, write a target
         "batch_size": "auto",            # rows per chunk, or "auto" = sized per table (see batching below)
         "fetch_size": 20000,
         "workers": "auto",               # masking processes: "auto" = CPU count - 1 (max 8), or a number
@@ -124,6 +126,8 @@ def _check_execution(ex: Dict[str, Any]) -> None:
     for k in ("batch_size", "workers"):
         if ex[k] != "auto" and (not isinstance(ex[k], int) or ex[k] < 1):
             raise ConfigError("execution.%s must be 'auto' or a positive integer" % k)
+    if ex["mode"] not in MODES:
+        raise ConfigError("execution.mode must be one of %s" % ", ".join(MODES))
     if ex["type_mismatch"] not in ("error", "warn"):
         raise ConfigError("execution.type_mismatch must be 'error' or 'warn'")
 

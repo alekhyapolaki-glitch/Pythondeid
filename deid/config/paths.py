@@ -19,6 +19,7 @@ DEFAULT_PATHS: Dict[str, str] = {
     "file_output_dir": "data/output",
     "profiles_dir": "config/profiles",
     "run_results_dir": "audit/results",
+    "copy_map": "config/copy_map.yaml",
 }
 
 

@@ -1,0 +1,33 @@
+# ---------------------------------------------------------------------------
+# On-the-fly masking (execution.mode: on_the_fly in settings.yaml, or --mode on_the_fly):
+#   read the SOURCE (the selected connection) -> mask -> write the TARGET (target_connection below).
+#   The source is only read: nothing in it changes, not even audit tables (those go to the target).
+#
+# WHICH tables: the tables in deid_rules.yaml, each masked column with its domain (exactly as in
+# place, so both modes give identical masked values). Columns without a rule are copied as they are.
+# WHERE they go: by default the same schema.table in the target database. List a table below only
+# when its target name or columns differ.
+#
+# The target tables must already exist with the same structure (DBA deploys the schema, e.g. SqlPackage
+# / DACPAC or generated scripts). 'validate' checks every table and column before anything is written.
+# ---------------------------------------------------------------------------
+target_connection: ''            # connection name in connections.yaml (target server + database)
+                                 # target can be: another table in the same database, another database
+                                 # on the same server, or a database on another server
+on_existing_rows: truncate       # truncate = empty each target table first (TRUNCATE, or batched DELETE
+                                 #            when a foreign key references it) | error = stop if not empty
+transfer: auto                   # auto      = set_based on the same SQL Server instance, else stream
+                                 # set_based = INSERT ... SELECT inside the instance (fastest; rows never leave it)
+                                 # stream    = source returns already-masked rows, written over a second connection
+disable_nonclustered_indexes: true   # rebuild target nonclustered indexes once after the load (faster)
+
+tables: []
+# Examples:
+# tables:
+#   - source: dbo.Customers
+#     target: dbo.Customers_Masked          # other table (same or other database); default: same name
+#     columns: all                          # all, or pick: [CustomerId, FirstName, LastName, Email]
+#     column_map:                           # source column: target column (only where names differ)
+#       Email: EmailAddress
+#   - source: dbo.Accounts
+#     target: stage.Accounts
