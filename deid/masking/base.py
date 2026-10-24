@@ -16,6 +16,8 @@ class BaseMasker:
     default_params: Dict[str, Any] = {}
     #: params that only change how the result is rendered; columns may override them
     format_params: FrozenSet[str] = frozenset()
+    #: algorithm choices a single column may override (e.g. a name column using method: hash)
+    column_params: FrozenSet[str] = frozenset()
     #: column type families this masker may be applied to
     families: Tuple[str, ...] = ("string",)
     #: True if two different inputs can never produce the same output
@@ -48,6 +50,11 @@ class BaseMasker:
     @classmethod
     def _check_params(cls, p: Dict[str, Any]) -> None:
         pass
+
+    @classmethod
+    def column_overridable(cls) -> FrozenSet[str]:
+        """Params a column entry in the rules may set for that column only."""
+        return cls.format_params | cls.column_params
 
     @classmethod
     def entity_required(cls, params: Dict[str, Any]) -> bool:

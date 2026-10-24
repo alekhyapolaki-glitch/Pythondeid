@@ -12,39 +12,23 @@ from .generalize import RedactMasker
 from .tokens import HashMasker
 
 
-class FirstNameMasker(BaseMasker):
-    type_name = "first_name"
-    description = "Replace with a deterministic first name from a built-in list"
-
-    def canonical(self, value):
-        return value.strip().lower()
-
-    def _mask(self, value):
-        return _match_case(value.strip(), self._pick(data.FIRST_NAMES, "first", self.canonical(value)))
-
-
-class LastNameMasker(FirstNameMasker):
-    type_name = "last_name"
-    description = "Replace with a deterministic last name from a built-in list"
-
-    def _mask(self, value):
-        return _match_case(value.strip(), self._pick(data.LAST_NAMES, "last", self.canonical(value)))
-
-
-# Name columns choose their algorithm with one setting; each method delegates to an existing masker.
-#   realistic - fake names (this class / account_name logic)
+# Name and location columns choose their algorithm with one setting; each method delegates to an
+# existing masker:
+#   realistic - fake values from the built-in lists (the _mask of each class below)
 #   hash      - HashMasker token, case-insensitive (unique; usable on key/unique columns)
 #   redact    - RedactMasker constant
 NAME_METHODS = ("realistic", "hash", "redact")
-
-
 NAME_METHOD_PARAMS = {"method": "realistic", "hash_length": 16, "hash_prefix": "", "redact_value": "REDACTED"}
 
 
-class MethodChoiceMasker(FirstNameMasker):
-    """Base for maskers whose algorithm is chosen by 'method': realistic | hash | redact."""
+class MethodChoiceMasker(BaseMasker):
+    """Base for maskers whose algorithm is chosen by 'method': realistic | hash | redact.
+
+    The policy sets the default method; a column can choose its own (column_params).
+    """
 
     default_params = dict(NAME_METHOD_PARAMS)
+    column_params = frozenset(NAME_METHOD_PARAMS)
 
     @classmethod
     def _check_params(cls, p):
@@ -63,10 +47,29 @@ class MethodChoiceMasker(FirstNameMasker):
         elif method == "redact":
             self._delegate = RedactMasker(self.domain, self._key, {"value": self.params["redact_value"]})
 
+    def canonical(self, value):
+        return value.strip().lower()
+
     def mask(self, value, entity=None):
         if self._delegate is not None:
             return self._delegate.mask(value)
         return super().mask(value, entity)
+
+
+class FirstNameMasker(MethodChoiceMasker):
+    type_name = "first_name"
+    description = "First names: method=realistic (fake first name from a list, default) | hash | redact"
+
+    def _mask(self, value):
+        return _match_case(value.strip(), self._pick(data.FIRST_NAMES, "first", self.canonical(value)))
+
+
+class LastNameMasker(MethodChoiceMasker):
+    type_name = "last_name"
+    description = "Last names: method=realistic (fake last name from a list, default) | hash | redact"
+
+    def _mask(self, value):
+        return _match_case(value.strip(), self._pick(data.LAST_NAMES, "last", self.canonical(value)))
 
 
 class FullNameMasker(MethodChoiceMasker):

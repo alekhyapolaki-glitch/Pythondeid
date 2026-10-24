@@ -168,12 +168,12 @@ def parse_rules(raw: Dict[str, Any], source: str = "<rules>") -> Rules:
                 raise ConfigError("%s: column '%s' needs a 'domain' or a 'type'" % (cw, c["name"]))
             extra = set(c) - _COLUMN_KEYS
             dom = domains[dname]
-            fmt_allowed = get_masker_class(dom.type).format_params
+            fmt_allowed = get_masker_class(dom.type).column_overridable()
             bad = extra - set(fmt_allowed)
             if bad:
-                raise ConfigError("%s: unknown key(s) %s for column '%s'. Column-level keys: %s; format overrides "
-                                  "for %s: %s" % (cw, sorted(bad), c["name"], sorted(_COLUMN_KEYS), dom.type,
-                                                  sorted(fmt_allowed) or "none"))
+                raise ConfigError("%s: unknown key(s) %s for column '%s'. Column-level keys: %s; per-column "
+                                  "settings for %s: %s" % (cw, sorted(bad), c["name"], sorted(_COLUMN_KEYS), dom.type,
+                                                           sorted(fmt_allowed) or "none"))
             overrides = {k: c[k] for k in extra}
             if overrides:
                 try:

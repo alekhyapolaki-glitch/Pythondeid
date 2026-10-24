@@ -112,6 +112,14 @@ def run_wizard(catalog: SchemaCatalog, existing: Optional[Rules] = None,
             if "output_format" in fmt and prompts.ask_yes_no("    Use a different output format for this column?", False):
                 opts = ["preserve", "dashed", "digits"] if dom.type == "ssn" else ["preserve", "digits", "grouped"]
                 rule.overrides["output_format"] = prompts.choose("    Output format", opts, "preserve")
+            if "method" in get_masker_class(dom.type).column_params:
+                default_method = (policy or {}).get("address" if dom.type == "street_address" else
+                                                    "city" if dom.type == "city" else "names", "realistic")
+                print("    realistic = fake values | hash = unique code | redact = constant")
+                chosen = prompts.choose("    Method for %s (policy default: %s)" % (c.name, default_method),
+                                        ["realistic", "hash", "redact"], default_method)
+                if chosen != default_method:
+                    rule.overrides["method"] = chosen
             out_type = prompts.ask("    Expected OUTPUT data type (Enter = same as column %s)" % c.type_display(),
                                    "", required=False)
             rule.output_type = out_type

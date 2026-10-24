@@ -9,6 +9,7 @@
 #   Check it against the files:                python main.py files-validate
 #   Run:                                       python main.py files-run   (--dry-run to test)
 # * Column names match the header text, ignoring upper/lower case and surrounding spaces.
+# * Name/address/city columns may pick their own method, e.g. {name: Account Name, domain: account_name, method: hash}
 # ---------------------------------------------------------------------------
 defaults:
   output_suffix: _deid          # customers.csv -> customers_deid.csv
@@ -39,7 +40,7 @@ files:
     sheets: [Accounts]          # only this sheet; omit to process every sheet
     columns:
       - {name: Account Number, domain: account_number}
-      - {name: Account Name, domain: account_name}
+      - {name: Account Name, domain: account_name, method: hash}   # this field only: unique code instead of fake name
       - {name: Owner SSN, domain: ssn, output_format: dashed}   # format-only override; same masked digits
       - {name: Card Number, domain: card_number}
       - {name: Member No, domain: member_no}

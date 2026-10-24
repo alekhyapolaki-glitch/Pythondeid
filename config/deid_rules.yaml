@@ -10,6 +10,8 @@
 #             expected_input_type: varchar(11)  live column must have this type (validate checks it)
 #             output_type:         char(11)     masked values must also fit this type
 #             output_format:       digits       format-only override (ssn, credit_card); identity unchanged
+#             method:              hash         this field's own method for name/address/city columns
+#                                               (realistic | hash | redact); default comes from policy
 #             entity_column:       CustomerId   person id for date_shift with shift_by: entity
 #           key_columns: optional unique NOT NULL column for batched updates when the table has no PK.
 #
@@ -84,7 +86,7 @@ tables:
   - schema: dbo
     table: Customers
     columns:
-      - {name: FirstName, domain: first_name}
+      - {name: FirstName, domain: first_name}                # method from policy.names
       - {name: LastName, domain: last_name}
       - {name: Email, domain: email, expected_input_type: varchar(100)}
       - {name: SSN, domain: ssn, expected_input_type: char(11), output_type: char(11)}

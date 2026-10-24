@@ -329,3 +329,67 @@ def test_error_messages_never_contain_values(keyring):
     with pytest.raises(MaskerError) as err:
         n.mask("98765432")
     assert "98765432" not in str(err.value)
+
+
+# ----------------------------------------------------------------- per-field name method
+def test_name_method_per_column():
+    from deid.config import parse_rules
+    from deid.database.schema import ColumnInfo, SchemaCatalog, TableInfo
+    from deid.engine import build_plan
+    r = parse_rules({
+        "policy": {"names": "realistic"},
+        "domains": {"names": {"type": "account_name"}},
+        "tables": [{"table": "T", "columns": [
+            {"name": "CustomerName", "domain": "names"},
+            {"name": "AccountName", "domain": "names", "method": "hash", "hash_prefix": "N-"},
+            {"name": "Nick", "type": "first_name", "method": "redact"}]}]})
+    cols = {c.name: c for c in r.tables[0].columns}
+    assert cols["CustomerName"].overrides == {} and r.domains["names"].params["method"] == "realistic"
+    assert cols["AccountName"].overrides == {"method": "hash", "hash_prefix": "N-"}
+    cat = SchemaCatalog()
+    t = TableInfo("dbo", "T", primary_key=["AccountName"], unique_sets=[["AccountName"]], row_count=10)
+    t.columns = {n.lower(): ColumnInfo("dbo", "T", n, "varchar", 100, 0, 0, n != "AccountName")
+                 for n in ("CustomerName", "AccountName", "Nick")}
+    cat.add_table(t)
+    plan = build_plan(cat, r, {}, True, {})
+    assert plan.ok, plan.errors   # hash on the PK column is allowed because it is unique
+    assert "method=hash" not in plan.describe() or "AccountName" in plan.describe()
+
+
+def test_name_method_per_column_masks(keyring):
+    from deid.masking import build_maskers, column_masker
+    from deid.config import parse_rules
+    r = parse_rules({"domains": {"names": {"type": "account_name"}},
+                     "tables": [{"table": "T", "columns": [{"name": "A", "domain": "names"}]}]})
+    base = build_maskers(r.domains.values(), keyring)["names"]
+    hashed = column_masker(base, keyring, {"method": "hash"})
+    redacted = column_masker(base, keyring, {"method": "redact"})
+    assert base.mask("ACME DEVELOPMENT INC").endswith("DEVELOPMENT INC")
+    assert len(hashed.mask("ACME DEVELOPMENT INC")) == 16 and redacted.mask("ACME DEVELOPMENT INC") == "REDACTED"
+    with pytest.raises(MaskerError):
+        column_masker(base, keyring, {"keep_industry_words": False})   # identity setting: not per column
+
+
+def test_fk_partner_inherits_column_method():
+    from deid.config import parse_rules
+    from deid.database.schema import ColumnInfo, ForeignKey, SchemaCatalog, TableInfo
+    from deid.engine import build_plan
+    cat = SchemaCatalog()
+    p = TableInfo("dbo", "P", primary_key=["Name"], unique_sets=[["Name"]])
+    p.columns = {"name": ColumnInfo("dbo", "P", "Name", "varchar", 100, 0, 0, False)}
+    c = TableInfo("dbo", "C", primary_key=["Id"], unique_sets=[["Id"]])
+    c.columns = {"id": ColumnInfo("dbo", "C", "Id", "int", 4, 10, 0, False),
+                 "pname": ColumnInfo("dbo", "C", "PName", "varchar", 100, 0, 0, True)}
+    cat.add_table(p)
+    cat.add_table(c)
+    cat.foreign_keys = [ForeignKey("FK_C_P", "dbo", "C", "dbo", "P", [("PName", "Name")])]
+    r = parse_rules({"domains": {"n": {"type": "full_name"}},
+                     "tables": [{"table": "P", "columns": [{"name": "Name", "domain": "n", "method": "hash"}]}]})
+    plan = build_plan(cat, r, {"auto_include_fk_columns": True}, True, {})
+    assert plan.ok, plan.errors
+    child = next(t for t in plan.tables if t.info.name == "C").columns[0]
+    assert child.overrides == {"method": "hash"}          # same masking on both sides of the FK
+    r2 = parse_rules({"domains": {"n": {"type": "full_name"}}, "tables": [
+        {"table": "P", "columns": [{"name": "Name", "domain": "n", "method": "hash"}]},
+        {"table": "C", "columns": [{"name": "PName", "domain": "n"}]}]})
+    assert any("different per-column settings" in e for e in build_plan(cat, r2, {}, True, {}).errors)

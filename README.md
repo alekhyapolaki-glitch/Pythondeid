@@ -166,6 +166,9 @@ policy:
 | `zip` | `truncate` `80202-1234`→`80200-0000` · `fpe` →`85819-5248` (unique, nothing kept) |
 
 * Set them with questions: `python main.py policy`. `configure` and `wizard` also ask them.
+* **Per field:** name, account-name, address and city columns can choose their own `method`, e.g.
+  `{name: AccountName, domain: account_name, method: hash}`. Both sides of a foreign key must use
+  the same method; an auto-added FK partner column inherits it.
 * They apply to every domain of that type. A domain that sets `mode`/`method` itself overrides the
   policy for that domain only.
 * The plan printed by `validate`, `dry-run` and `run` shows the resulting `[mode=…]`/`[method=…]`

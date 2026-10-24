@@ -115,6 +115,14 @@ class Plan:
         return "\n".join(lines)
 
 
+def _identity_overrides(rule: Optional[ColumnRule], domain: str, rules: Rules) -> Dict[str, Any]:
+    """Per-column settings that change the masked value (format-only overrides excluded)."""
+    if rule is None or domain not in rules.domains:
+        return {}
+    cls = get_masker_class(rules.domains[domain].type)
+    return {k: v for k, v in rule.overrides.items() if k in cls.column_params}
+
+
 def build_plan(catalog: SchemaCatalog, rules: Rules, execution: Dict[str, Any], chunking_available: bool,
                batching: Optional[Dict[str, Any]] = None) -> Plan:
     errors: List[str] = []
@@ -154,18 +162,25 @@ def build_plan(catalog: SchemaCatalog, rules: Rules, execution: Dict[str, Any], 
                     "child. Change the FK to NO ACTION for the masking run." % (fk.name, fk.child_fqn, fk.parent_fqn, c))
             ok_key = (os_.lower(), ot.lower())
             other = targets.get(ok_key, {}).get(oc.lower())
+            src_rule = targets[(s, t)][c][2]
             if other is not None:
                 if other[0] != domain:
                     errors.append(
                         "FK %s links %s.%s.%s (domain '%s') and %s.%s.%s (domain '%s'); both sides must use the same "
                         "domain or the relationship breaks." % (fk.name, s, t, c, domain, os_, ot, oc, other[0]))
+                elif _identity_overrides(src_rule, domain, rules) != _identity_overrides(other[2], domain, rules):
+                    errors.append(
+                        "FK %s links %s.%s.%s and %s.%s.%s with different per-column settings (e.g. method); both "
+                        "sides must mask identically." % (fk.name, s, t, c, os_, ot, oc))
                 continue
             if execution.get("auto_include_fk_columns", True) and catalog.get(os_, ot) is not None:
                 if ok_key not in targets:
                     targets[ok_key] = {}
                     order.append(ok_key)
                     key_override[ok_key] = []
-                targets[ok_key][oc.lower()] = (domain, True, None)
+                inherited = _identity_overrides(src_rule, domain, rules)
+                partner_rule = ColumnRule(oc, domain, overrides=inherited) if inherited else None
+                targets[ok_key][oc.lower()] = (domain, True, partner_rule)
                 queue.append((ok_key, oc.lower()))
                 warnings.append("Auto-added %s.%s.%s (domain '%s') because FK %s references masked column %s.%s.%s"
                                 % (os_, ot, oc, domain, fk.name, s, t, c))
@@ -197,7 +212,8 @@ def build_plan(catalog: SchemaCatalog, rules: Rules, execution: Dict[str, Any], 
                 errors.append("%s: mask type '%s' supports %s columns only" % (where, dom.type, "/".join(cls.families)))
             if dom.type == "nullify" and not ci.is_nullable:
                 errors.append("%s is NOT NULL; it cannot be nullified" % where)
-            if ti.is_unique_column(ci.name) and not is_injective(dom.type, dom.params):
+            col_params = dict(dom.params, **(rule.overrides if rule is not None else {}))
+            if ti.is_unique_column(ci.name) and not is_injective(dom.type, col_params):
                 errors.append("%s is part of a primary key/unique index but '%s' is not collision-free; use an "
                               "injective type (fpe, account_number, ssn, email, hash, ...)" % (where, dom.type))
             cp = ColumnPlan(ci, dom, ordinal, auto)

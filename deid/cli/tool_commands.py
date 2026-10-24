@@ -41,8 +41,8 @@ def cmd_list_types(args):
         print("%s\n    %s" % (name, cls.description))
         if cls.default_params:
             print("    params:        %s" % cls.default_params)
-        if cls.format_params:
-            print("    column-level:  %s (format only, may differ per column)" % ", ".join(sorted(cls.format_params)))
+        if cls.column_overridable():
+            print("    per column:    %s" % ", ".join(sorted(cls.column_overridable())))
         if guide:
             print("    input types:   %s" % guide["input"])
             print("    output types:  %s" % guide["output"])

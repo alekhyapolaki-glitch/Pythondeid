@@ -129,10 +129,10 @@ def parse_file_rules(raw: Dict[str, Any], rules: Rules, source: str = "<file_rul
                                     "database so values mask identically." % (cw, c["domain"], rules.source_path))
             cls = get_masker_class(dom.type)
             overrides = {k: v for k, v in c.items() if k not in ("name", "domain", "entity_column")}
-            bad = set(overrides) - set(cls.format_params)
+            bad = set(overrides) - set(cls.column_overridable())
             if bad:
                 raise FileRuleError("%s: unknown key(s) %s (format overrides allowed for %s: %s)"
-                                    % (cw, sorted(bad), dom.type, sorted(cls.format_params) or "none"))
+                                    % (cw, sorted(bad), dom.type, sorted(cls.column_overridable()) or "none"))
             needs_entity = cls.entity_required(dom.params)
             if needs_entity and not c.get("entity_column"):
                 raise FileRuleError("%s: domain '%s' shifts dates per person; add entity_column (the person id "
