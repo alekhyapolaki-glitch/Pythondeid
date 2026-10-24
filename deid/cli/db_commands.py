@@ -97,12 +97,12 @@ def cmd_run(args):
             print("\nFix the errors above (python main.py validate) before running.")
             return 2
         if not args.resume:
-            prior = [r for r in engine.previous_runs()
-                     if r["mode"] == "run" and r["rules_hash"] == rules.content_hash and r["status"] != "FAILED"]
+            # Any earlier masking run (whatever rules or profile) means the data is already masked.
+            prior = [r for r in engine.previous_runs() if r["mode"] == "run" and r["status"] != "FAILED"]
             if prior and not args.force:
                 r = prior[0]
-                print("\nRun %s (status %s, %s) already applied these rules to this database. Masking masked data "
-                      "again would break consistency." % (r["run_id"], r["status"], r["started_at"]))
+                print("\nRun %s (status %s, %s) already masked this database. Masking masked data again would "
+                      "break consistency." % (r["run_id"], r["status"], r["started_at"]))
                 if r["status"] in ("PARTIAL", "RUNNING"):
                     print("Resume it with: python main.py run --resume %s" % r["run_id"])
                 print("Use --force only on a freshly restored copy.")

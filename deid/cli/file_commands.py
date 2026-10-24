@@ -6,12 +6,9 @@ import csv
 from pathlib import Path
 
 from .. import __version__
-from ..config import (
-    load_rules,
-)
 from ..masking import MaskerError
 from ..utils import prompts
-from .common import _check_key_pin, _keyring, _load, _setup_logging
+from .common import _check_key_pin, _keyring, _load, _rules, _setup_logging
 
 
 def _file_rules(args, settings, rules):
@@ -23,7 +20,7 @@ def cmd_files_discover(args):
     """Read the headers of the files in the input folder and draft file_rules.yaml with suggested domains."""
     from deid.files import draft_file_rules
     settings = _load(args)
-    rules = load_rules(args.rules)
+    rules = _rules(args, settings)
     input_dir = args.input or settings.paths["file_input_dir"]
     if not Path(input_dir).is_dir():
         print("Input folder %s does not exist. Put your CSV/Excel files there (file_input_dir in paths.yaml) "
@@ -44,7 +41,7 @@ def cmd_files_validate(args):
     """Check the file rules against the actual files: matches, sheets, columns, domains."""
     from deid.files import find_inputs, read_headers
     settings = _load(args)
-    rules = load_rules(args.rules)
+    rules = _rules(args, settings)
     fr = _file_rules(args, settings, rules)
     input_root = Path(args.input or settings.paths["file_input_dir"])
     matched, unmatched = find_inputs(str(input_root), fr)
@@ -80,13 +77,10 @@ def cmd_files_validate(args):
 
 def cmd_files_run(args):
     """De-identify CSV/Excel files into the output folder (originals are never modified)."""
-    from dataclasses import asdict
-
-    from deid.audit import AuditTrail, new_run_id
-    from deid.files import FileDeidentifier, FileRuleError, find_inputs, output_path_for
+    from deid.files import find_inputs, output_path_for
     settings = _load(args)
     _setup_logging(settings)
-    rules = load_rules(args.rules)
+    rules = _rules(args, settings)
     keyring = _keyring(settings)
     _check_key_pin(settings, keyring)
     fr = _file_rules(args, settings, rules)
@@ -107,31 +101,45 @@ def cmd_files_run(args):
             "Write the de-identified copies to %s? (originals are not changed)" % output_dir, True):
         print("Aborted.")
         return 1
+    result = run_file_masking(settings, rules, keyring, fr, matched, input_root, output_dir, args.dry_run,
+                              args.overwrite)
+    return 0 if not result["failed"] else 2
+
+
+def run_file_masking(settings, rules, keyring, fr, matched, input_root, output_dir, dry_run, overwrite):
+    """Mask the matched files and write the audit; shared by files-run and refresh."""
+    from dataclasses import asdict
+
+    from deid.advisor import resolve_workers
+    from deid.audit import AuditTrail, new_run_id
+    from deid.files import FileDeidentifier, FileRuleError
     run_id = new_run_id()
     audit = AuditTrail(settings.audit, run_id, None)
-    audit.start_run("files-dry-run" if args.dry_run else "files", {
-        "rules_file": str(rules.source_path), "rules_hash": rules.content_hash,
+    audit.start_run("files-dry-run" if dry_run else "files", {
+        "rules_file": str(rules.source_path), "rules_hash": rules.content_hash, "profile": rules.profile,
         "file_rules": str(fr.source_path), "file_rules_hash": fr.content_hash,
         "key_fingerprint": keyring.fingerprint(), "tool_version": __version__,
         "input": str(input_root), "output": str(output_dir), "files_planned": len(matched),
     })
-    from deid.advisor import resolve_workers
     deid = FileDeidentifier(rules, fr, keyring, resolve_workers(settings.execution.get("workers", "auto")))
     ok = failed = 0
-    for path, rule in matched:
-        try:
-            res = deid.process(path, input_root, output_dir, rule, args.dry_run, args.overwrite)
-            ok += 1
-            print("  OK   %s: %d rows, masked cells %s%s" % (path.name, res.rows, res.masked_cells,
-                                                         ("; " + res.message) if res.message else ""))
-            audit.file_result(asdict(res))
-        except (FileRuleError, MaskerError, OSError, ValueError, csv.Error) as exc:
-            failed += 1
-            print("  FAIL %s: %s" % (path.name, exc))
-            audit.event("ERROR", str(exc), str(path))
-            audit.file_result({"rule": rule.name, "input_path": str(path), "status": "FAILED", "message": str(exc)})
-    deid.close()
-    status = ("DRY_RUN_OK" if args.dry_run else "SUCCEEDED") if not failed else ("PARTIAL" if ok else "FAILED")
+    try:
+        for path, rule in matched:
+            try:
+                res = deid.process(path, input_root, output_dir, rule, dry_run, overwrite)
+                ok += 1
+                print("  OK   %s: %d rows, masked cells %s%s" % (path.name, res.rows, res.masked_cells,
+                                                             ("; " + res.message) if res.message else ""))
+                audit.file_result(asdict(res))
+            except (FileRuleError, MaskerError, OSError, ValueError, csv.Error) as exc:
+                failed += 1
+                print("  FAIL %s: %s" % (path.name, exc))
+                audit.event("ERROR", str(exc), str(path))
+                audit.file_result({"rule": rule.name, "input_path": str(path), "status": "FAILED",
+                                   "message": str(exc)})
+    finally:
+        deid.close()
+    status = ("DRY_RUN_OK" if dry_run else "SUCCEEDED") if not failed else ("PARTIAL" if ok else "FAILED")
     audit.end_run(status, "%d ok, %d failed" % (ok, failed), ok, 0)
     print("\nRun %s: %s (%d ok, %d failed). Audit: %s" % (run_id, status, ok, failed, audit.dir))
-    return 0 if not failed else 2
+    return {"run_id": run_id, "status": status, "ok": ok, "failed": failed, "audit_dir": str(audit.dir)}

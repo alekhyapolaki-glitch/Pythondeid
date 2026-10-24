@@ -15,7 +15,7 @@ from .. import __version__
 from ..advisor import resolve_workers
 from ..audit import AuditTrail, new_run_id
 from ..config import Rules, Settings
-from ..database.connection import server_info, with_retry
+from ..database.connection import acquire_run_lock, server_info, with_retry
 from ..database.schema import SchemaCatalog, enabled_triggers, fk_status, index_disabled
 from ..database.sql import hash_expr, qualified, quote_ident
 from ..masking import ALGORITHM_VERSION, BaseMasker, KeyRing, build_maskers, column_masker
@@ -35,6 +35,10 @@ PARALLEL_MIN_ROWS = 100000
 
 class TableFailed(Exception):
     pass
+
+
+class RunLocked(PlanError):
+    """Another masking run holds the database's run lock."""
 
 
 @dataclass
@@ -68,6 +72,7 @@ class Engine:
         self.read = None
         self.work = None
         self.audit_conn = None
+        self.lock_conn = None
         self._state: Dict[str, Any] = {}
         self._data_changed = False  # any masked data committed in this run (=> never report FAILED)
 
@@ -84,7 +89,7 @@ class Engine:
 
     def close(self) -> None:
         self.pool.close()
-        for c in (self.read, self.work, self.audit_conn):
+        for c in (self.read, self.work, self.audit_conn, self.lock_conn):  # closing lock_conn releases the lock
             try:
                 if c is not None:
                     c.close()
@@ -124,6 +129,12 @@ class Engine:
             raise PlanError("Plan has errors; run 'validate' and fix them first")
         run_id = new_run_id()
         db_audit = bool(self.settings.audit.get("write_to_db", True)) and not dry_run
+        if not dry_run:
+            # One masking run per database at a time (scheduled and manual runs alike).
+            self.lock_conn = self.factory.connect(autocommit=True)
+            if not acquire_run_lock(self.lock_conn, "pythondeid:%s" % info.get("database", "")):
+                raise RunLocked("Another masking run is in progress on database %s; try again when it has finished"
+                                % info.get("database"))
         if db_audit:
             self.audit_conn = self.factory.connect(autocommit=True)
         audit = AuditTrail(self.settings.audit, run_id, self.audit_conn if db_audit else None)
@@ -146,6 +157,7 @@ class Engine:
         audit.start_run(mode, dict(
             info, tool_version=__version__, rules_file=str(self.rules.source_path or ""),
             rules_hash=self.rules.content_hash, key_fingerprint=self.keyring.fingerprint(),
+            profile=self.rules.profile, policy=dict(self.rules.policy),
             algorithm_version=ALGORITHM_VERSION, resumed_from=resume_from, tables_planned=len(plan.tables),
             workers=self.workers,
         ))

@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from ..masking import ALGORITHM_VERSION, MaskerError, get_masker_class
 from .base import ConfigError, _read_yaml, yaml
 from .policy import DEFAULT_POLICY, _apply_policy, _parse_policy
+from .profiles import Profile
 
 
 @dataclass
@@ -73,6 +74,8 @@ class Rules:
     content_hash: str = ""
     algorithm_version: int = ALGORITHM_VERSION
     policy: Dict[str, str] = field(default_factory=lambda: dict(DEFAULT_POLICY))
+    #: masking profile the policy came from ("" = the rules file's own policy)
+    profile: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -113,7 +116,7 @@ def _define_domain(domains: Dict[str, DomainRule], name: str, mtype: str, params
     domains[name] = new
 
 
-def parse_rules(raw: Dict[str, Any], source: str = "<rules>") -> Rules:
+def parse_rules(raw: Dict[str, Any], source: str = "<rules>", profile: Optional[Profile] = None) -> Rules:
     unknown = set(raw) - {"domains", "tables", "algorithm_version", "policy"}
     if unknown:
         raise ConfigError("Unknown top-level key(s) in %s: %s" % (source, sorted(unknown)))
@@ -194,13 +197,15 @@ def parse_rules(raw: Dict[str, Any], source: str = "<rules>") -> Rules:
         tables.append(TableRule(schema, table, cols, [str(k) for k in (t.get("key_columns") or [])]))
 
     policy = _parse_policy(raw.get("policy"), source)
-    _apply_policy(domains, policy, source)
+    if profile is not None:
+        policy.update(profile.policy)  # the profile decides for its audience
+    _apply_policy(domains, policy, source + (" (profile %s)" % profile.name if profile else ""))
     for d in domains.values():
         for ref in get_masker_class(d.type).referenced_domains(get_masker_class(d.type).validate_params(d.params)):
             if ref not in domains:
                 raise ConfigError("%s: domain '%s' masks free-text hits with domain '%s', which is not defined"
                                   % (source, d.name, ref))
-    rules = Rules(domains=domains, tables=tables, policy=policy)
+    rules = Rules(domains=domains, tables=tables, policy=policy, profile=profile.name if profile else "")
     rules.content_hash = rules.compute_hash()
     return rules
 
@@ -208,9 +213,9 @@ def parse_rules(raw: Dict[str, Any], source: str = "<rules>") -> Rules:
 _COLUMN_KEYS = {"name", "domain", "type", "params", "expected_input_type", "output_type", "entity_column"}
 
 
-def load_rules(path: str) -> Rules:
+def load_rules(path: str, profile: Optional[Profile] = None) -> Rules:
     p = Path(path)
-    rules = parse_rules(_read_yaml(p), str(p))
+    rules = parse_rules(_read_yaml(p), str(p), profile)
     rules.source_path = p
     if not rules.tables:
         raise ConfigError("%s defines no tables to de-identify" % p)

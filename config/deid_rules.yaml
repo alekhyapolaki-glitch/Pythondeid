@@ -20,15 +20,19 @@
 # ---------------------------------------------------------------------------
 algorithm_version: 1      # pin: all servers must run the same masking algorithm version
 
+# The policy below is the default. A profile (config/profiles/<name>.yaml, chosen with --profile)
+# overrides it for its audience, e.g. --profile internal / --profile external.
 policy:                   # masking choices; apply to every domain of these types that does not set them itself
   ssn:             full           # full | last4
   account_number:  full           # full | last4
-  credit_card:     first6_last4   # full | last4 | first6_last4
+  credit_card:     full           # full | last4 | first6_last4
   names:           realistic      # realistic | hash | redact   (full_name and account_name columns)
   phone:           full           # full | last4 | area_code
   address:         realistic      # realistic | hash | redact   (street_address columns)
   city:            realistic      # realistic | hash | redact
-  zip:             truncate       # truncate (first 3 digits kept) | fpe (fully de-identified)
+  zip:             truncate       # truncate | hipaa (3 digits, low-population areas -> 000) | fpe
+  dates:           shift          # shift (per-person offset) | month | year (HIPAA Safe Harbor)
+  free_text:       scrub          # scrub | redact | nullify | hash
 
 domains:
   email:
@@ -48,7 +52,7 @@ domains:
     type: account_number
     params: {normalize: digits, pad_to: 12, mode: full}   # an explicit mode overrides the policy
 
-  card_number:              # mode comes from policy.credit_card
+  card_number:              # mode comes from policy.credit_card / the profile
     type: credit_card
 
   account_name:             # people -> fake person names; businesses -> fake company names keeping INC/LLC/...
@@ -66,14 +70,13 @@ domains:
     type: zip
     params: {keep_digits: 3}
 
-  person_dates:             # one offset per person => intervals between a person's dates are preserved
+  person_dates:             # one offset per person => intervals kept; "dates: year" in a profile keeps the year only
     type: date_shift
     params: {shift_by: entity, max_days: 180, entity_normalize: trim_lower}
 
   notes:
     type: free_text
-    params:
-      mode: scrub           # scrub | redact | nullify | hash
+    params:                 # mode (scrub | redact | nullify | hash) comes from policy.free_text / the profile
       on_overflow: truncate
       detectors:
         email: {action: mask, domain: email}     # same token as the Email columns
@@ -94,7 +97,7 @@ tables:
       - {name: Street, domain: street_address}
       - {name: City, domain: city}
       - {name: Zip, domain: zip}
-      - {name: DateOfBirth, domain: person_dates, entity_column: CustomerId}
+      - {name: DateOfBirth, domain: person_dates, entity_column: CustomerId, birth_date: true}   # ages 90+ grouped
       - {name: MemberNo, domain: member_no, expected_input_type: bigint}
 
   - schema: dbo

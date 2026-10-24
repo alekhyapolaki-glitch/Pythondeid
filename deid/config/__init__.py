@@ -16,6 +16,7 @@ from .connections import (
 )
 from .paths import DEFAULT_PATHS, load_paths
 from .policy import DEFAULT_POLICY, POLICY_OPTIONS, _parse_policy, update_policy_in_file
+from .profiles import Profile, list_profiles, load_profile
 from .rules import (
                           CSV_COLUMNS,
                           ColumnRule,
@@ -30,9 +31,37 @@ from .rules import (
 from .settings import DEFAULT_SETTINGS, SECRET_KEY_ENV_DEFAULT, Settings, load_settings, save_settings
 
 __all__ = [
-    "CSV_COLUMNS", "DEFAULT_CONNECTION", "DEFAULT_PATHS", "DEFAULT_POLICY", "DEFAULT_SETTINGS", "PASSWORD_ENV_DEFAULT",
-    "POLICY_OPTIONS", "PROJECT_ROOT", "SECRET_KEY_ENV_DEFAULT", "ColumnRule", "ConfigError", "DomainRule", "Rules",
-    "Settings", "TableRule", "_deep_merge", "_parse_policy", "_read_yaml", "_resolve", "load_connections",
-    "load_paths", "load_rules", "load_settings", "parse_rules", "rules_from_csv", "save_connection", "save_rules",
-    "save_settings", "update_policy_in_file", "validate_connection",
+                          "CSV_COLUMNS",
+                          "DEFAULT_CONNECTION",
+                          "DEFAULT_PATHS",
+                          "DEFAULT_POLICY",
+                          "DEFAULT_SETTINGS",
+                          "PASSWORD_ENV_DEFAULT",
+                          "POLICY_OPTIONS",
+                          "PROJECT_ROOT",
+                          "SECRET_KEY_ENV_DEFAULT",
+                          "ColumnRule",
+                          "ConfigError",
+                          "DomainRule",
+                          "Profile",
+                          "Rules",
+                          "Settings",
+                          "TableRule",
+                          "_deep_merge",
+                          "_parse_policy",
+                          "_read_yaml",
+                          "_resolve",
+                          "list_profiles",
+                          "load_connections",
+                          "load_paths",
+                          "load_profile",
+                          "load_rules",
+                          "load_settings",
+                          "parse_rules",
+                          "rules_from_csv",
+                          "save_connection",
+                          "save_rules",
+                          "save_settings",
+                          "update_policy_in_file",
+                          "validate_connection",
 ]

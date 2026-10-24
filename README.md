@@ -445,6 +445,34 @@ Layering is enforced by `tests/test_architecture.py`: `masking` and `utils` depe
 `files` → `engine`/`config`/`masking`; only `cli` talks to the user. The same test caps module size
 and requires every module to have a docstring.
 
+## Profiles and scheduled refresh
+
+Two **profiles** in `config/profiles/` set the masking policy per audience. Domains and tables are
+shared, and both use the same key:
+
+| Setting | `internal` (DEV/QA/analysts) | `external` (vendors) |
+|---|---|---|
+| SSN, account numbers, cards, phone, email | full | full |
+| Names, addresses, cities | realistic | realistic |
+| Dates tied to a person | shift per person (intervals and ages kept) | **year only**; birth dates of people 90+ grouped |
+| ZIP | first 3 digits | first 3 digits; HIPAA low-population ZIP3 areas → `000` |
+| Free text | scrub | **redact** |
+
+```bat
+python main.py --profile external validate
+python main.py --profile external dry-run
+python main.py --profile internal files-run
+scripts\deid_refresh.cmd external uat --with-files      :: unattended (Stonebranch / SQL Agent)
+```
+
+* Mark birth-date columns with `birth_date: true` so the age-90+ rule applies under `dates: year`.
+* A database can only be masked once. Any earlier masking run (whatever the profile) blocks a new
+  one, because double masking breaks consistency. Restore a fresh copy instead.
+* Only one masking run per database at a time: a database application lock (`sp_getapplock`)
+  enforces it.
+* **Scheduling:** `docs/scheduling.md` covers the exit codes, Stonebranch task settings and the
+  workflow. `docs/sql_agent_refresh_job.sql` is the SQL Agent alternative.
+
 ## Quality and security status
 
 | Check | Tool | Result |

@@ -14,3 +14,7 @@ recommendations_csv: config/recommendations.csv
 file_rules: config/file_rules.yaml            # which files/sheets/columns, mapped to the same domains as the DB
 file_input_dir: data/input                    # files to de-identify (originals are never modified)
 file_output_dir: data/output                  # de-identified copies: <name>_deid.csv / .xlsx (same subfolders)
+
+# --- profiles and scheduled runs
+profiles_dir: config/profiles                 # masking profiles: internal.yaml, external.yaml, ...
+run_results_dir: audit/results               # refresh writes <run>.json here for the scheduler (Stonebranch)

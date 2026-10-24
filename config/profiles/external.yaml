@@ -1,0 +1,21 @@
+# Profile "external": data delivered to vendors / third parties.
+# Strictest settings for GLBA, PCI DSS and HIPAA Safe Harbor:
+#   * no partial identifiers (no last4 / BIN), cards fully masked
+#   * dates tied to a person reduced to the YEAR; birth years of people aged 90+ grouped (birth_date columns)
+#   * ZIP kept to 3 digits, and the HIPAA low-population 3-digit areas become 000
+#   * free text fully redacted (regex scrubbing cannot find names written in prose)
+# NOTE: this profile uses the same secret key as "internal", so values that are masked the same way
+#       (e.g. emails, SSNs) are identical in internal and vendor copies.  See SECURITY.md.
+# Use with:  python main.py --profile external run      (or refresh)
+description: External delivery - strictest settings (GLBA, PCI DSS, HIPAA Safe Harbor)
+policy:
+  ssn:             full
+  account_number:  full
+  credit_card:     full
+  names:           realistic
+  phone:           full
+  address:         realistic
+  city:            realistic
+  zip:             hipaa
+  dates:           year
+  free_text:       redact

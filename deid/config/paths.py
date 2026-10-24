@@ -17,6 +17,8 @@ DEFAULT_PATHS: Dict[str, str] = {
     "file_rules": "config/file_rules.yaml",
     "file_input_dir": "data/input",
     "file_output_dir": "data/output",
+    "profiles_dir": "config/profiles",
+    "run_results_dir": "audit/results",
 }
 
 

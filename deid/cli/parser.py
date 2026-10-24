@@ -33,6 +33,7 @@ from .setup_commands import (
     cmd_policy,
     cmd_test_connection,
 )
+from .refresh_command import cmd_refresh
 from .tool_commands import cmd_list_types, cmd_preview, cmd_test_vectors
 
 log = logging.getLogger("deid")
@@ -47,6 +48,7 @@ def build_parser():
     p.add_argument("-c", "--connection", help="connection name from connections.yaml (default: its 'default')")
     p.add_argument("--paths", default=DEFAULT_PATHS, help="file locations YAML (default config/paths.yaml)")
     p.add_argument("--rules", help="rules YAML (default: rules_file in paths.yaml)")
+    p.add_argument("-p", "--profile", help="masking profile from config/profiles (e.g. internal, external)")
     p.add_argument("--server", help="override database.server")
     p.add_argument("--database", help="override database.database")
     p.add_argument("-y", "--yes", action="store_true", help="non-interactive: no questions (use with care)")
@@ -74,6 +76,14 @@ def build_parser():
     sub.add_parser("wizard", help="interactive questions to build the rules YAML").set_defaults(func=cmd_wizard)
     sub.add_parser("validate", help="check rules against the live schema").set_defaults(func=cmd_validate)
     sub.add_parser("dry-run", help="mask in memory, validate every value, change nothing").set_defaults(func=cmd_dry_run)
+
+    rf = sub.add_parser("refresh", help="unattended run for schedulers (Stonebranch / SQL Agent): validate, "
+                                        "dry-run, mask, optional files; exit codes + JSON result")
+    rf.add_argument("--with-files", action="store_true", help="also de-identify files (file_rules.yaml)")
+    rf.add_argument("--resume", metavar="RUN_ID", help="continue a PARTIAL run")
+    rf.add_argument("--force", action="store_true", help="mask even if an earlier run masked this database")
+    rf.add_argument("--result-file", help="JSON result path (default: run_results_dir in paths.yaml)")
+    rf.set_defaults(func=cmd_refresh)
 
     r = sub.add_parser("run", help="de-identify the database in place")
     r.add_argument("--resume", metavar="RUN_ID", help="continue an interrupted/partial run")

@@ -9,15 +9,25 @@ from .base import BaseMasker, MaskerError, _choice, _non_negative_int
 from .fpe import FeistelCipher, encrypt_text
 
 
+# HIPAA Safe Harbor (45 CFR 164.514(b)(2)(i)(B)): the initial three ZIP digits may be kept only if the
+# area they cover has more than 20,000 people; HHS lists these 3-digit areas (2000 Census) as having
+# 20,000 or fewer, so they must become 000.  Review against current HHS guidance before relying on it.
+HIPAA_RESTRICTED_ZIP3 = frozenset({
+    "036", "059", "063", "102", "203", "556", "692", "790", "821", "823", "830", "831", "878", "879", "884",
+    "890", "893",
+})
+
+
 class ZipMasker(BaseMasker):
     type_name = "zip"
-    description = "ZIP/postal: mode=truncate keeps first N digits (HIPAA style), mode=fpe is bijective"
+    description = ("ZIP/postal: mode=truncate keeps the first N digits; mode=hipaa keeps 3 and zeroes the HIPAA "
+                   "low-population areas; mode=fpe is bijective")
     default_params = {"mode": "truncate", "keep_digits": 3, "fill": "0"}
     families = ("string", "int")
 
     @classmethod
     def _check_params(cls, p):
-        _choice(p, "mode", ("truncate", "fpe"))
+        _choice(p, "mode", ("truncate", "hipaa", "fpe"))
         _non_negative_int(p, "keep_digits")
         if not (isinstance(p["fill"], str) and len(p["fill"]) == 1 and p["fill"].isdigit()):
             raise MaskerError("zip.fill must be a single digit")
@@ -30,11 +40,15 @@ class ZipMasker(BaseMasker):
     def _mask(self, value):
         if self.params["mode"] == "fpe":
             return encrypt_text(self._cipher, value, b"zip", digits=True, letters=False)
+        keep = self.params["keep_digits"]
+        if self.params["mode"] == "hipaa":
+            digits = re.sub(r"\D", "", value)
+            keep = 0 if digits[:3] in HIPAA_RESTRICTED_ZIP3 else 3
         seen = 0
         out = []
         for ch in value:
             if ch.isdigit():
-                out.append(ch if seen < self.params["keep_digits"] else self.params["fill"])
+                out.append(ch if seen < keep else self.params["fill"])
                 seen += 1
             else:
                 out.append(ch)
@@ -63,7 +77,10 @@ class DateShiftMasker(BaseMasker):
     type_name = "date_shift"
     description = ("Shift dates by a deterministic +/- N day offset. shift_by=entity uses ONE offset per person "
                    "(column's entity_column), preserving intervals between that person's dates")
-    default_params = {"max_days": 365, "generalize": "none", "shift_by": "value", "entity_normalize": "trim_lower"}
+    default_params = {"max_days": 365, "generalize": "none", "shift_by": "value", "entity_normalize": "trim_lower",
+                      "birth_date": False, "reference_year": 0}
+    #: a column marks itself as a birth date; same domain (and per-person offset) as the person's other dates
+    column_params = frozenset({"birth_date"})
     families = ("string", "date")
     uses_entity = True
 
@@ -74,6 +91,10 @@ class DateShiftMasker(BaseMasker):
         _choice(p, "generalize", ("none", "year", "month"))
         _choice(p, "shift_by", ("value", "entity"))
         _choice(p, "entity_normalize", ("none", "trim_lower", "digits"))
+        if not isinstance(p["birth_date"], bool):
+            raise MaskerError("date_shift.birth_date must be true or false")
+        if not isinstance(p["reference_year"], int) or p["reference_year"] < 0:
+            raise MaskerError("date_shift.reference_year must be 0 (current year) or a year")
 
     @classmethod
     def entity_required(cls, params):
@@ -119,6 +140,11 @@ class DateShiftMasker(BaseMasker):
             # messages, e.g. "month must be in 1..12", describe the problem without the data.
             raise MaskerError("Invalid date: %s" % exc) from None
         gen = self.params["generalize"]
+        if gen in ("year", "month") and self.params["birth_date"]:
+            # Safe Harbor: ages over 89 (and birth years revealing them) are grouped as "90 or older".
+            ref = self.params["reference_year"] or _dt.date.today().year
+            if ref - date.year >= 90:
+                date = _dt.date(ref - 90, 1, 1)
         if gen == "year":
             new = _dt.date(date.year, 1, 1)
         elif gen == "month":

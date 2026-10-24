@@ -35,6 +35,24 @@ contain input values.
 * Changing the key or the rules changes every masked value. Pin the key with
   `security.expected_key_fingerprint` and the algorithm with `algorithm_version`.
 
+## Profiles and linkage
+
+* **Same key for internal and external profiles (current decision).** Values masked the same way
+  in both profiles are identical. For example, a customer's masked email or SSN in a vendor file
+  equals the one in the internal QA copy. A vendor that also obtained internal masked data could link
+  the two. To prevent that, give the external profile its own key: run external refreshes with a
+  different `DEID_SECRET_KEY` and pinned fingerprint.
+* **HIPAA Safe Harbor (external profile).**
+  * Dates tied to a person keep only the year.
+  * Birth dates of people aged 90+ are grouped.
+  * ZIP codes keep 3 digits, and HHS-listed low-population ZIP3 areas become `000`.
+  * Free text is redacted.
+  * Safe Harbor also requires removing the other identifiers (names, contact details, account and
+    record numbers, etc.), so make sure every such column is in the rules, and that there is no
+    actual knowledge that the remaining data could identify a person. Have your privacy officer
+    review the rules.
+* **Run lock:** one masking run per database at a time (`sp_getapplock`).
+
 ## Input safety
 
 * **SQL:**

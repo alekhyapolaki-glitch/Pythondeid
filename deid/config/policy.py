@@ -27,13 +27,22 @@ POLICY_OPTIONS: Dict[str, Tuple[Tuple[str, ...], str, Tuple[str, ...], str]] = {
                        "Street addresses: realistic (fake address), hash (unique code) or redact (constant)?"),
     "city":           (("city",), "method", tuple(NAME_METHODS),
                        "Cities: realistic (fake city), hash (unique code) or redact (constant)?"),
-    "zip":            (("zip",), "mode", ("truncate", "fpe"),
-                       "ZIP codes: truncate (keep first 3 digits, HIPAA style) or fpe (all digits de-identified)?"),
+    "zip":            (("zip",), "mode", ("truncate", "hipaa", "fpe"),
+                       "ZIP codes: truncate (keep first 3 digits), hipaa (same, plus low-population areas -> 000) "
+                       "or fpe (all digits de-identified)?"),
+    "dates":          (("date_shift",), "generalize", ("shift", "month", "year"),
+                       "Dates: shift (realistic, per-person offset), month (yyyy-mm-01) or year (yyyy-01-01, "
+                       "HIPAA Safe Harbor)?"),
+    "free_text":      (("free_text",), "mode", ("scrub", "redact", "nullify", "hash"),
+                       "Free text: scrub (replace PII found in the text), redact, nullify or hash?"),
 }
+#: policy values that are spelled differently from the masker parameter they set
+POLICY_VALUE_MAP: Dict[str, Dict[str, str]] = {"dates": {"shift": "none"}}
 
 
 DEFAULT_POLICY = {"ssn": "full", "account_number": "full", "credit_card": "full", "names": "realistic",
-                  "phone": "full", "address": "realistic", "city": "realistic", "zip": "truncate"}
+                  "phone": "full", "address": "realistic", "city": "realistic", "zip": "truncate",
+                  "dates": "shift", "free_text": "scrub"}
 
 
 def _parse_policy(raw: Any, source: str) -> Dict[str, str]:
@@ -57,7 +66,7 @@ def _apply_policy(domains: Dict[str, DomainRule], policy: Dict[str, str], source
     for key, (types, param, _, _) in POLICY_OPTIONS.items():
         for d in domains.values():
             if d.type in types and param not in d.params:
-                d.params[param] = policy[key]
+                d.params[param] = POLICY_VALUE_MAP.get(key, {}).get(policy[key], policy[key])
                 d.policy_keys.append(param)
                 try:
                     get_masker_class(d.type).validate_params(d.params)
@@ -74,7 +83,9 @@ _POLICY_COMMENTS = {
     "phone": "full | last4 | area_code",
     "address": "realistic | hash | redact   (street_address columns)",
     "city": "realistic | hash | redact",
-    "zip": "truncate (first 3 digits kept) | fpe (fully de-identified)",
+    "zip": "truncate | hipaa (3 digits, low-population areas -> 000) | fpe",
+    "dates": "shift (per-person offset) | month | year (HIPAA Safe Harbor)",
+    "free_text": "scrub | redact | nullify | hash",
 }
 
 

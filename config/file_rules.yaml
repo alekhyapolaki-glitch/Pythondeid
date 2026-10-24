@@ -30,7 +30,7 @@ files:
       - {name: Address, domain: street_address}
       - {name: City, domain: city}
       - {name: Zip, domain: zip}
-      - {name: DOB, domain: person_dates, entity_column: CustomerId}   # same per-person shift as the DB
+      - {name: DOB, domain: person_dates, entity_column: CustomerId, birth_date: true}   # same per-person shift as the DB
       - {name: Account Number, domain: account_number}
       - {name: Account Name, domain: account_name}
       - {name: Notes, domain: notes}

@@ -89,7 +89,8 @@ def test_update_policy_in_file_keeps_comments(tmp_path):
 
 def test_sample_rules_policy_section():
     r = load_rules("config/deid_rules.yaml")
-    assert set(r.policy) == {"ssn", "account_number", "credit_card", "names", "phone", "address", "city", "zip"}
+    assert set(r.policy) == {"ssn", "account_number", "credit_card", "names", "phone", "address", "city", "zip",
+                             "dates", "free_text"}
 
 
 # ----------------------------------------------------------------- separate connection / path files

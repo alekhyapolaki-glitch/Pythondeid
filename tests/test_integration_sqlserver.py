@@ -123,3 +123,30 @@ def test_two_databases_mask_identically(tmp_path):
         rows_a = [r[:-1] if "Customers" in sql else r for r in _query(a, sql)]  # drop CreatedAt default
         rows_b = [r[:-1] if "Customers" in sql else r for r in _query(b, sql)]
         assert rows_a == rows_b, sql
+
+
+def test_refresh_command_exit_codes(tmp_path, monkeypatch):
+    """refresh (as Stonebranch runs it): 0 on success, then 3 because the copy is already masked."""
+    import json
+
+    import yaml
+
+    from deid.cli import main
+    _create_db(tmp_path, "DeidDemoRefresh")
+    conn = {"default": "it", "connections": {"it": {
+        "server": os.environ["DEID_IT_SERVER"], "database": "DeidDemoRefresh", "auth": "sql",
+        "username": os.environ.get("DEID_IT_USER", "sa"), "password_env": "DEID_IT_PASSWORD",
+        "trust_server_certificate": True}}}
+    (tmp_path / "connections.yaml").write_text(yaml.safe_dump(conn), encoding="utf-8")
+    (tmp_path / "paths.yaml").write_text(yaml.safe_dump({
+        "rules_file": str(ROOT / "config" / "deid_rules.yaml"), "profiles_dir": str(ROOT / "config" / "profiles"),
+        "audit_dir": str(tmp_path / "audit"), "log_dir": str(tmp_path / "logs"),
+        "run_results_dir": str(tmp_path / "results")}), encoding="utf-8")
+    monkeypatch.setenv("DEID_SECRET_KEY", KEY)
+    args = ["--settings", str(ROOT / "config" / "settings.yaml"), "--connections", str(tmp_path / "connections.yaml"),
+            "--paths", str(tmp_path / "paths.yaml"), "--profile", "external", "refresh"]
+    assert main(args) == 0
+    result = json.loads((tmp_path / "results" / "latest_external.json").read_text(encoding="utf-8"))
+    assert result["status"] == "SUCCEEDED" and [s["step"] for s in result["steps"]] == ["validate", "dry_run", "mask"]
+    assert main(args) == 3
+    assert json.loads((tmp_path / "results" / "latest_external.json").read_text())["status"] == "ALREADY_MASKED"

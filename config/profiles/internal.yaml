@@ -1,0 +1,15 @@
+# Profile "internal": developers, QA, analysts, lower environments (data stays inside the company).
+# Realistic values and real date intervals, so applications, joins and reports keep working.
+# Use with:  python main.py --profile internal run      (or refresh)
+description: Internal use - realistic, consistent data for DEV/QA/UAT and analysts
+policy:
+  ssn:             full        # full | last4
+  account_number:  full        # full | last4
+  credit_card:     full        # full | last4 | first6_last4
+  names:           realistic   # realistic | hash | redact   (a column may set its own method)
+  phone:           full        # full | last4 | area_code
+  address:         realistic   # realistic | hash | redact
+  city:            realistic   # realistic | hash | redact
+  zip:             truncate    # truncate | hipaa | fpe
+  dates:           shift       # shift (per-person offset, intervals kept) | month | year
+  free_text:       scrub       # scrub | redact | nullify | hash

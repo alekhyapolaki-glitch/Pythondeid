@@ -135,3 +135,19 @@ def server_info(conn) -> Dict[str, Any]:
         "server": row[0], "database": row[1], "login": row[2],
         "version": row[3], "edition": row[4], "client_host": row[5],
     }
+
+
+def acquire_run_lock(conn, resource: str) -> bool:
+    """Exclusive, session-owned application lock (sp_getapplock); held until the connection closes.
+
+    Returns False immediately (no waiting) if another session holds it, e.g. a scheduled run overlapping a
+    manual one on the same database.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        "SET NOCOUNT ON; DECLARE @r INT; "
+        "EXEC @r = sp_getapplock @Resource = ?, @LockMode = 'Exclusive', @LockOwner = 'Session', @LockTimeout = 0; "
+        "SELECT @r;",
+        [resource],
+    )
+    return cur.fetchone()[0] >= 0

@@ -74,7 +74,7 @@ class AuditTrail:
                 client_host NVARCHAR(256) NULL, tool_version NVARCHAR(32) NULL, rules_file NVARCHAR(512) NULL,
                 rules_hash NVARCHAR(64) NULL, key_fingerprint NVARCHAR(64) NULL, resumed_from NVARCHAR(64) NULL,
                 tables_planned INT NULL, tables_completed INT NULL, rows_updated BIGINT NULL,
-                message NVARCHAR(MAX) NULL, algorithm_version INT NULL""",
+                message NVARCHAR(MAX) NULL, algorithm_version INT NULL, profile NVARCHAR(64) NULL""",
             "column_result": """
                 id BIGINT IDENTITY(1,1) PRIMARY KEY, run_id NVARCHAR(64) NOT NULL, schema_name SYSNAME NOT NULL,
                 table_name SYSNAME NOT NULL, column_name SYSNAME NOT NULL, domain NVARCHAR(128) NULL,
@@ -96,7 +96,8 @@ class AuditTrail:
             obj = "%s.%s" % (s, name)
             cur.execute("IF OBJECT_ID(N'%s', N'U') IS NULL CREATE TABLE %s (%s)" % (obj, self.t(name), cols))
         # upgrade audit tables created by earlier versions
-        for table, col, typ in (("run", "algorithm_version", "INT"), ("column_result", "batch_size", "INT")):
+        for table, col, typ in (("run", "algorithm_version", "INT"), ("column_result", "batch_size", "INT"),
+                                ("run", "profile", "NVARCHAR(64)")):
             cur.execute("IF COL_LENGTH(N'%s.%s', N'%s') IS NULL ALTER TABLE %s ADD %s %s NULL"
                         % (s, table, col, self.t(table), quote_ident(col), typ))
 
@@ -112,11 +113,12 @@ class AuditTrail:
             self.conn.cursor().execute(
                 "INSERT INTO %s (run_id, mode, status, started_at, server_name, database_name, db_login, os_user, "  # nosec B608
                 "client_host, tool_version, rules_file, rules_hash, key_fingerprint, resumed_from, tables_planned, "
-                "algorithm_version) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)" % self.t("run"),
+                "algorithm_version, profile) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)" % self.t("run"),
                 [self.run_id, mode, "RUNNING", _now(), info.get("server"), info.get("database"), info.get("login"),
                  self.summary["os_user"], self.summary["client_host"], info.get("tool_version"),
                  info.get("rules_file"), info.get("rules_hash"), info.get("key_fingerprint"),
-                 info.get("resumed_from"), info.get("tables_planned"), info.get("algorithm_version")],
+                 info.get("resumed_from"), info.get("tables_planned"), info.get("algorithm_version"),
+                 info.get("profile") or None],
             )
         self.event("INFO", "Run started (mode=%s)" % mode)
 

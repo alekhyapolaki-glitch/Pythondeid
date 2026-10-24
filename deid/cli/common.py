@@ -63,10 +63,20 @@ def _engine(args, settings, rules):
     return Engine(settings, rules, _keyring(settings), factory)
 
 
+def _rules(args, settings=None):
+    """The rules file with the selected profile's policy applied (--profile)."""
+    profile = None
+    if getattr(args, "profile", None):
+        from ..config import load_profile
+        settings = settings or _load(args)
+        profile = load_profile(args.profile, settings.paths["profiles_dir"])
+    return load_rules(args.rules, profile)
+
+
 def _plan(args):
     settings = _settings(args)
     _setup_logging(settings)
-    rules = load_rules(args.rules)
+    rules = _rules(args, settings)
     engine = _engine(args, settings, rules)
     info = engine.connect()
     plan = engine.plan()

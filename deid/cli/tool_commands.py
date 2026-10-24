@@ -5,11 +5,8 @@ from __future__ import annotations
 import csv
 import json
 
-from ..config import (
-    load_rules,
-)
 from ..masking import ALGORITHM_VERSION, MASKERS, MaskerError, build_maskers, create_masker
-from .common import _keyring, _load
+from .common import _keyring, _load, _rules
 
 
 def cmd_preview(args):
@@ -18,7 +15,7 @@ def cmd_preview(args):
     keyring = _keyring(settings)
     params = json.loads(args.params) if args.params else {}
     if args.domain and not args.type:
-        rules = load_rules(args.rules)
+        rules = _rules(args)
         if args.domain not in rules.domains:
             print("Domain %s not in %s" % (args.domain, args.rules))
             return 1
@@ -70,7 +67,7 @@ def cmd_test_vectors(args):
 
     settings = _load(args)
     keyring = _keyring(settings)
-    rules = load_rules(args.rules)
+    rules = _rules(args)
     maskers = build_maskers(rules.domains.values(), keyring)
     rows = []
     for name, d in sorted(rules.domains.items()):
