@@ -6,7 +6,7 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from .base import ConfigError, _deep_merge, _read_yaml, _resolve, yaml
 from .connections import DEFAULT_CONNECTION, load_connections, validate_connection
@@ -77,8 +77,18 @@ def load_settings(path: str, connections_path: Optional[str] = None, connection:
         raise ConfigError("Unknown section(s) in %s: %s" % (p, sorted(unknown)))
     legacy_db = raw.pop("database", None)
     merged = _deep_merge(DEFAULT_SETTINGS, raw)
+    paths = _resolve_paths(merged, paths_path)
+    name, db = _resolve_connection(connections_path, connection, legacy_db, p)
+    _check_execution(merged["execution"])
+    _check_batching(merged["batching"])
+    if not str(merged["audit"]["schema"]).replace("_", "").isalnum():
+        raise ConfigError("audit.schema must be a simple identifier")
+    return Settings(database=db, source_path=p, paths=paths, connection_name=name, **merged)
+
+
+def _resolve_paths(merged: Dict[str, Any], paths_path: Optional[str]) -> Dict[str, Any]:
+    """paths.yaml decides where files go; older settings.yaml values are honoured when paths.yaml is absent."""
     paths = load_paths(paths_path)
-    # paths.yaml decides where files go; older settings.yaml values are honoured when paths.yaml is absent
     if not (paths_path and Path(paths_path).exists()):
         if merged["audit"].get("output_dir"):
             paths["audit_dir"] = _resolve(merged["audit"]["output_dir"])
@@ -86,25 +96,28 @@ def load_settings(path: str, connections_path: Optional[str] = None, connection:
             paths["log_dir"] = _resolve(merged["logging"]["dir"])
     merged["audit"]["output_dir"] = paths["audit_dir"]
     merged["logging"]["dir"] = paths["log_dir"]
+    return paths
 
-    name = ""
+
+def _resolve_connection(connections_path: Optional[str], connection: Optional[str], legacy_db: Any,
+                        settings_path: Path) -> Tuple[str, Dict[str, Any]]:
+    """(connection name, connection settings): connections.yaml, else a legacy settings.yaml section, else defaults."""
     if connections_path and Path(connections_path).exists():
         default, conns = load_connections(connections_path)
         name = connection or default
         if name not in conns:
             raise ConfigError("Connection '%s' is not in %s (available: %s). Add it with: python main.py configure"
                               % (name, connections_path, ", ".join(conns) or "none"))
-        db = conns[name]
-    elif connection:
+        return name, conns[name]
+    if connection:
         raise ConfigError("--connection %s given but %s does not exist; run: python main.py configure"
                           % (connection, connections_path))
-    elif legacy_db is not None:
-        db = validate_connection(legacy_db, "%s database" % p)
-        name = "settings.yaml"
-    else:
-        db = dict(DEFAULT_CONNECTION)
+    if legacy_db is not None:
+        return "settings.yaml", validate_connection(legacy_db, "%s database" % settings_path)
+    return "", dict(DEFAULT_CONNECTION)
 
-    ex = merged["execution"]
+
+def _check_execution(ex: Dict[str, Any]) -> None:
     for k in ("fetch_size", "max_retries", "collision_check_max_values"):
         if not isinstance(ex[k], int) or ex[k] < (0 if k == "max_retries" else 1):
             raise ConfigError("execution.%s must be a positive integer" % k)
@@ -113,15 +126,14 @@ def load_settings(path: str, connections_path: Optional[str] = None, connection:
             raise ConfigError("execution.%s must be 'auto' or a positive integer" % k)
     if ex["type_mismatch"] not in ("error", "warn"):
         raise ConfigError("execution.type_mismatch must be 'error' or 'warn'")
-    b = merged["batching"]
+
+
+def _check_batching(b: Dict[str, Any]) -> None:
     for k in ("target_batch_mb", "min_batch_size", "max_batch_size"):
         if not isinstance(b[k], int) or b[k] < 1:
             raise ConfigError("batching.%s must be a positive integer" % k)
     if b["min_batch_size"] > b["max_batch_size"]:
         raise ConfigError("batching.min_batch_size must be <= max_batch_size")
-    if not str(merged["audit"]["schema"]).replace("_", "").isalnum():
-        raise ConfigError("audit.schema must be a simple identifier")
-    return Settings(database=db, source_path=p, paths=paths, connection_name=name, **merged)
 
 
 def save_settings(settings: Settings, path: str) -> None:

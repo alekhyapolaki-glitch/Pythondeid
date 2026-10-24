@@ -208,57 +208,71 @@ def profile_column(conn, table: TableInfo, col: ColumnInfo, sample: int = 5000) 
     }
 
 
+_PROFILE_FIELDS = ("sampled", "min_len", "max_len", "max_digits", "all_digits_pct", "leading_zero_pct", "top_patterns")
+
+
 def column_recommendations(plan, conn, sample: int = 5000) -> List[Dict[str, Any]]:
     """One row per planned column: type facts, profile, required output length, and advice."""
     rows: List[Dict[str, Any]] = []
     by_domain: Dict[str, List[Dict[str, Any]]] = {}
     for tp in plan.tables:
         for cp in tp.columns:
-            ci = cp.info
-            prof = profile_column(conn, tp.info, ci, sample) if not cp.is_nullify else {"sampled": 0}
-            need = required_output_chars(cp.domain.type, dict(cp.domain.params, **cp.overrides), ci.max_chars)
-            target = cp.output_info or ci
-            advice: List[str] = []
-            if need and target.max_chars and target.max_chars > 0 and need > target.max_chars:
-                advice.append("masked values need %d chars but %s holds %d" % (need, target.type_display(), target.max_chars))
-            if cp.domain.type == "date_shift" and cp.domain.params.get("shift_by", "value") == "value":
-                advice.append("consider shift_by: entity with entity_column (person id) to keep date intervals")
-            if cp.domain.type in ("redact", "free_text") and ci.family == "string" and ci.max_chars == -1:
-                advice.append("long free text: review samples after dry-run; prose may contain names")
-            row = {
-                "table": tp.fqn, "column": ci.name, "actual_type": ci.type_display(),
-                "expected_input_type": cp.expected_input_type or "", "output_type": target.type_display(),
-                "domain": cp.domain.name, "mask_type": cp.domain.type, "required_output_chars": need or "",
-                "strategy": tp.strategy, "batch_size": tp.batch_size if tp.strategy == "chunked" else "",
-                "recommended_types": TYPE_GUIDE.get(cp.domain.type, {}).get("output", ""),
-            }
-            row.update({k: prof.get(k, "") for k in ("sampled", "min_len", "max_len", "max_digits",
-                                                      "all_digits_pct", "leading_zero_pct", "top_patterns")})
-            row["advice"] = advice
+            row = _column_row(tp, cp, conn, sample)
             rows.append(row)
-            by_domain.setdefault(cp.domain.name, []).append(dict(row, family=ci.family, params=cp.domain.params))
-
-    # Cross-column advice per domain: mixed representations break consistency unless normalised.
+            by_domain.setdefault(cp.domain.name, []).append(dict(row, family=cp.info.family, params=cp.domain.params))
     for dname, cols in by_domain.items():
-        families = {c["family"] for c in cols}
-        mtype = cols[0]["mask_type"]
-        mixed_zero = any(c.get("leading_zero_pct") not in ("", 0, 0.0) for c in cols) and len(cols) > 1
-        if (mtype in ("fpe", "account_number", "phone") and cols[0]["params"].get("normalize", "none") != "digits"
-                and (len(families) > 1 or mixed_zero)):
-            pad = max([c["max_digits"] or 0 for c in cols] + [1])
-            msg = ("domain '%s' is stored as %s across tables%s: set params {normalize: digits, pad_to: %d} so the "
-                   "same number masks identically everywhere" % (
-                       dname, "/".join(sorted(families)), " with leading zeros" if mixed_zero else "", pad))
-            for c in rows:
-                if c["domain"] == dname:
-                    c["advice"].append(msg)
-        if mtype == "ssn":
-            pats = {c["top_patterns"].split(" (")[0] for c in cols if c["top_patterns"]}
-            if len(pats) > 1:
-                for c in rows:
-                    if c["domain"] == dname:
-                        c["advice"].append("SSN formats differ between columns (%s); masks still match on digits. "
-                                           "Use output_format per column to standardise" % ", ".join(sorted(pats)))
+        for msg in _domain_advice(dname, cols):
+            for r in rows:
+                if r["domain"] == dname:
+                    r["advice"].append(msg)
     for r in rows:
         r["advice"] = "; ".join(r["advice"])
     return rows
+
+
+def _column_row(tp, cp, conn, sample: int) -> Dict[str, Any]:
+    ci = cp.info
+    prof = profile_column(conn, tp.info, ci, sample) if not cp.is_nullify else {"sampled": 0}
+    need = required_output_chars(cp.domain.type, dict(cp.domain.params, **cp.overrides), ci.max_chars)
+    target = cp.output_info or ci
+    row = {
+        "table": tp.fqn, "column": ci.name, "actual_type": ci.type_display(),
+        "expected_input_type": cp.expected_input_type or "", "output_type": target.type_display(),
+        "domain": cp.domain.name, "mask_type": cp.domain.type, "required_output_chars": need or "",
+        "strategy": tp.strategy, "batch_size": tp.batch_size if tp.strategy == "chunked" else "",
+        "recommended_types": TYPE_GUIDE.get(cp.domain.type, {}).get("output", ""),
+    }
+    row.update({k: prof.get(k, "") for k in _PROFILE_FIELDS})
+    row["advice"] = _column_advice(cp, need, target)
+    return row
+
+
+def _column_advice(cp, need: Optional[int], target: ColumnInfo) -> List[str]:
+    ci, mtype = cp.info, cp.domain.type
+    advice: List[str] = []
+    if need and target.max_chars and target.max_chars > 0 and need > target.max_chars:
+        advice.append("masked values need %d chars but %s holds %d" % (need, target.type_display(), target.max_chars))
+    if mtype == "date_shift" and cp.domain.params.get("shift_by", "value") == "value":
+        advice.append("consider shift_by: entity with entity_column (person id) to keep date intervals")
+    if mtype in ("redact", "free_text") and ci.family == "string" and ci.max_chars == -1:
+        advice.append("long free text: review samples after dry-run; prose may contain names")
+    return advice
+
+
+def _domain_advice(dname: str, cols: List[Dict[str, Any]]) -> List[str]:
+    """Cross-column advice: mixed representations of one domain break consistency unless normalised."""
+    mtype = cols[0]["mask_type"]
+    if mtype in ("fpe", "account_number", "phone") and cols[0]["params"].get("normalize", "none") != "digits":
+        families = {c["family"] for c in cols}
+        mixed_zero = len(cols) > 1 and any(c.get("leading_zero_pct") not in ("", 0, 0.0) for c in cols)
+        if len(families) > 1 or mixed_zero:
+            pad = max([c["max_digits"] or 0 for c in cols] + [1])
+            return ["domain '%s' is stored as %s across tables%s: set params {normalize: digits, pad_to: %d} so the "
+                    "same number masks identically everywhere" % (
+                        dname, "/".join(sorted(families)), " with leading zeros" if mixed_zero else "", pad)]
+    if mtype == "ssn":
+        pats = {c["top_patterns"].split(" (")[0] for c in cols if c["top_patterns"]}
+        if len(pats) > 1:
+            return ["SSN formats differ between columns (%s); masks still match on digits. "
+                    "Use output_format per column to standardise" % ", ".join(sorted(pats))]
+    return []

@@ -13,11 +13,6 @@ from ..masking.suggestions import suggest_type
 from .schema import ColumnInfo, SchemaCatalog, TableInfo
 
 
-
-
-
-
-
 def export_schema_csv(catalog: SchemaCatalog, path: str, only_suggested: bool = False) -> int:
     """Write table structure + suggested masks to CSV for review/editing (mask_type left for the user)."""
     rows = 0
@@ -59,80 +54,11 @@ def run_wizard(catalog: SchemaCatalog, existing: Optional[Rules] = None,
     print("\n=== De-identification rules wizard ===")
     print("Answer the questions below; press Enter to accept the [default].\n")
     domains: Dict[str, DomainRule] = dict(existing.domains) if existing else {}
-
-    schemas = sorted({t.schema for t in catalog.tables.values()})
-    chosen_schemas = prompts.choose_many("Which schemas contain data to de-identify?", schemas, "all")
-    candidates = sorted((t for t in catalog.tables.values() if t.schema in chosen_schemas), key=lambda t: t.fqn)
-    if not candidates:
-        raise SystemExit("No tables found in the chosen schemas.")
-
-    flagged = [t.fqn for t in candidates if any(suggest_type(c) for c in t.columns.values())]
-    print("\nTables with likely PII columns: %s" % (", ".join(flagged) or "none detected"))
-    names = [t.fqn for t in candidates]
-    default_sel = ",".join(str(names.index(n) + 1) for n in flagged) if flagged else "all"
-    selected = prompts.choose_many("Which tables should be de-identified?", names, default_sel)
-
     tables: List[TableRule] = []
-    types = sorted(MASKERS)
-    for fqn in selected:
-        t = next(x for x in candidates if x.fqn == fqn)
-        _print_table(t)
-        cols: List[ColumnRule] = []
-        for c in t.ordered_columns():
-            sug = suggest_type(c)
-            if c.is_identity or c.is_computed:
-                continue
-            if not prompts.ask_yes_no("  Mask %s.%s (%s)?" % (t.name, c.name, c.type_display()), default=bool(sug)):
-                continue
-            allowed = [m for m in types if c.family in get_masker_class(m).families]
-            print("    Mask types for this column:")
-            mtype = prompts.choose("    Mask type", allowed, sug if sug in allowed else allowed[0])
-            print("    A *domain* ties columns together: the same value in the same domain is masked identically in "
-                  "every table (needed for joins/FKs).")
-            existing_same = [d for d in domains.values() if d.type == mtype]
-            default_domain = existing_same[0].name if existing_same else mtype
-            dname = prompts.ask("    Domain name", default_domain)
-            if dname not in domains:
-                params = _ask_key_questions(mtype, c, domains)
-                params.update(_ask_params(mtype, skip=set(params)))
-                domains[dname] = DomainRule(dname, mtype, params)
-            elif domains[dname].type != mtype:
-                print("    Domain '%s' is already a '%s' domain; using that definition." % (dname, domains[dname].type))
-            dom = domains[dname]
-            rule = ColumnRule(c.name, dname, expected_input_type=c.type_display())
-            if dom.params.get("shift_by") == "entity":
-                others = [x.name for x in t.ordered_columns() if x.name != c.name and x.family != "other"]
-                pk = [k.lower() for k in t.primary_key]
-                default_ent = next((x for x in others if re.search(
-                    r"(person|patient|customer|member|employee|client|subject).*id$", x.lower()) and x.lower() not in pk),
-                    next((x for x in others if x.lower().endswith("id") and x.lower() not in pk), others[0]))
-                rule.entity_column = prompts.choose("    Which column identifies the person in %s?" % t.name,
-                                                    others, default_ent)
-            fmt = get_masker_class(dom.type).format_params
-            if "output_format" in fmt and prompts.ask_yes_no("    Use a different output format for this column?", False):
-                opts = ["preserve", "dashed", "digits"] if dom.type == "ssn" else ["preserve", "digits", "grouped"]
-                rule.overrides["output_format"] = prompts.choose("    Output format", opts, "preserve")
-            if "method" in get_masker_class(dom.type).column_params:
-                default_method = (policy or {}).get("address" if dom.type == "street_address" else
-                                                    "city" if dom.type == "city" else "names", "realistic")
-                print("    realistic = fake values | hash = unique code | redact = constant")
-                chosen = prompts.choose("    Method for %s (policy default: %s)" % (c.name, default_method),
-                                        ["realistic", "hash", "redact"], default_method)
-                if chosen != default_method:
-                    rule.overrides["method"] = chosen
-            out_type = prompts.ask("    Expected OUTPUT data type (Enter = same as column %s)" % c.type_display(),
-                                   "", required=False)
-            rule.output_type = out_type
-            cols.append(rule)
-        if cols:
-            key_cols: List[str] = []
-            if not t.primary_key:
-                print("  %s has no primary key." % t.fqn)
-                raw = prompts.ask("  Optional unique NOT NULL key column(s) for batched updates (comma separated)",
-                                  "", required=False)
-                key_cols = [k.strip() for k in raw.split(",") if k.strip()]
-            tables.append(TableRule(t.schema, t.name, cols, key_cols))
-
+    for t in _choose_tables(catalog):
+        rule = _ask_table(t, domains, policy or {})
+        if rule is not None:
+            tables.append(rule)
     if existing:
         kept = [et for et in existing.tables if et.fqn.lower() not in {x.fqn.lower() for x in tables}]
         if kept and prompts.ask_yes_no("Keep %d table(s) from the existing rules file?" % len(kept), True):
@@ -143,6 +69,98 @@ def run_wizard(catalog: SchemaCatalog, existing: Optional[Rules] = None,
         rules.policy = dict(policy)
     rules.content_hash = rules.compute_hash()
     return rules
+
+
+def _choose_tables(catalog: SchemaCatalog) -> List[TableInfo]:
+    schemas = sorted({t.schema for t in catalog.tables.values()})
+    chosen_schemas = prompts.choose_many("Which schemas contain data to de-identify?", schemas, "all")
+    candidates = sorted((t for t in catalog.tables.values() if t.schema in chosen_schemas), key=lambda t: t.fqn)
+    if not candidates:
+        raise SystemExit("No tables found in the chosen schemas.")
+    flagged = [t.fqn for t in candidates if any(suggest_type(c) for c in t.columns.values())]
+    print("\nTables with likely PII columns: %s" % (", ".join(flagged) or "none detected"))
+    names = [t.fqn for t in candidates]
+    default_sel = ",".join(str(names.index(n) + 1) for n in flagged) if flagged else "all"
+    selected = prompts.choose_many("Which tables should be de-identified?", names, default_sel)
+    by_name = {t.fqn: t for t in candidates}
+    return [by_name[n] for n in selected]
+
+
+def _ask_table(t: TableInfo, domains: Dict[str, DomainRule], policy: Dict[str, str]) -> Optional[TableRule]:
+    _print_table(t)
+    cols = [r for r in (_ask_column(t, c, domains, policy) for c in t.ordered_columns()
+                        if not (c.is_identity or c.is_computed)) if r is not None]
+    if not cols:
+        return None
+    key_cols: List[str] = []
+    if not t.primary_key:
+        print("  %s has no primary key." % t.fqn)
+        raw = prompts.ask("  Optional unique NOT NULL key column(s) for batched updates (comma separated)",
+                          "", required=False)
+        key_cols = [k.strip() for k in raw.split(",") if k.strip()]
+    return TableRule(t.schema, t.name, cols, key_cols)
+
+
+def _ask_column(t: TableInfo, c: ColumnInfo, domains: Dict[str, DomainRule],
+                policy: Dict[str, str]) -> Optional[ColumnRule]:
+    sug = suggest_type(c)
+    if not prompts.ask_yes_no("  Mask %s.%s (%s)?" % (t.name, c.name, c.type_display()), default=bool(sug)):
+        return None
+    allowed = [m for m in sorted(MASKERS) if c.family in get_masker_class(m).families]
+    print("    Mask types for this column:")
+    mtype = prompts.choose("    Mask type", allowed, sug if sug in allowed else allowed[0])
+    dom = _choose_domain(c, mtype, domains)
+    rule = ColumnRule(c.name, dom.name, expected_input_type=c.type_display())
+    if dom.params.get("shift_by") == "entity":
+        rule.entity_column = _ask_entity_column(t, c)
+    _ask_column_overrides(rule, c, dom, policy)
+    rule.output_type = prompts.ask("    Expected OUTPUT data type (Enter = same as column %s)" % c.type_display(),
+                                   "", required=False)
+    return rule
+
+
+def _choose_domain(c: ColumnInfo, mtype: str, domains: Dict[str, DomainRule]) -> DomainRule:
+    """Pick (or create) the domain; a new one gets its key questions and optional parameters."""
+    print("    A *domain* ties columns together: the same value in the same domain is masked identically in "
+          "every table (needed for joins/FKs).")
+    same_type = [d for d in domains.values() if d.type == mtype]
+    dname = prompts.ask("    Domain name", same_type[0].name if same_type else mtype)
+    if dname not in domains:
+        params = _ask_key_questions(mtype, c, domains)
+        params.update(_ask_params(mtype, skip=set(params)))
+        domains[dname] = DomainRule(dname, mtype, params)
+    elif domains[dname].type != mtype:
+        print("    Domain '%s' is already a '%s' domain; using that definition." % (dname, domains[dname].type))
+    return domains[dname]
+
+
+_PERSON_ID = re.compile(r"(person|patient|customer|member|employee|client|subject).*id$")
+
+
+def _ask_entity_column(t: TableInfo, c: ColumnInfo) -> str:
+    others = [x.name for x in t.ordered_columns() if x.name != c.name and x.family != "other"]
+    pk = {k.lower() for k in t.primary_key}
+    candidates = [x for x in others if x.lower() not in pk]
+    default = next((x for x in candidates if _PERSON_ID.search(x.lower())),
+                   next((x for x in candidates if x.lower().endswith("id")), others[0]))
+    return prompts.choose("    Which column identifies the person in %s?" % t.name, others, default)
+
+
+def _ask_column_overrides(rule: ColumnRule, c: ColumnInfo, dom: DomainRule, policy: Dict[str, str]) -> None:
+    """Per-column settings: output format (SSN/account/card) and method (names, address, city)."""
+    cls = get_masker_class(dom.type)
+    if "output_format" in cls.format_params and prompts.ask_yes_no(
+            "    Use a different output format for this column?", False):
+        opts = ["preserve", "dashed", "digits"] if dom.type == "ssn" else ["preserve", "digits", "grouped"]
+        rule.overrides["output_format"] = prompts.choose("    Output format", opts, "preserve")
+    if "method" in cls.column_params:
+        policy_key = {"street_address": "address", "city": "city"}.get(dom.type, "names")
+        default_method = policy.get(policy_key, "realistic")
+        print("    realistic = fake values | hash = unique code | redact = constant")
+        chosen = prompts.choose("    Method for %s (policy default: %s)" % (c.name, default_method),
+                                ["realistic", "hash", "redact"], default_method)
+        if chosen != default_method:
+            rule.overrides["method"] = chosen
 
 
 def _ask_key_questions(mtype: str, col: ColumnInfo, domains: Dict[str, DomainRule]) -> Dict[str, object]:

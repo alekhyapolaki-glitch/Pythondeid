@@ -52,20 +52,7 @@ def cmd_files_validate(args):
         sheets = [s for s in heads if s] if not rule.sheets else rule.sheets
         print("  %s  -> rule '%s'" % (path.name, rule.name))
         for sheet in (sheets or [""]):
-            header = {h.lower() for h in heads.get(next((k for k in heads if k.lower() == sheet.lower()), sheet), [])}
-            if sheet and not any(k.lower() == sheet.lower() for k in heads):
-                print("      sheet %s: NOT FOUND" % sheet)
-                problems += 1
-                continue
-            for c in rule.columns:
-                dom = rules.domains[c.domain]
-                found = c.name.lower() in header and (not c.entity_column or c.entity_column.lower() in header)
-                effective = dict(dom.params, **c.overrides)  # the column's own settings win over the domain/policy
-                setting = ", ".join("%s=%s" % (k, effective[k]) for k in ("mode", "method") if k in effective)
-                print("      %s%-28s -> %-16s %s%s" % ((sheet + ": ") if sheet else "", c.name, c.domain,
-                                                   ("[%s] " % setting) if setting else "",
-                                                   "" if found else "  <-- NOT FOUND"))
-                problems += 0 if found else 1
+            problems += _check_sheet(rule, rules, heads, sheet)
     for path in unmatched:
         print("  %s  (no matching rule; will be skipped)" % path.name)
     if not matched:
@@ -74,6 +61,26 @@ def cmd_files_validate(args):
     print("\nFile rules are VALID" if not problems else "\n%d problem(s) found" % problems)
     return 0 if not problems else 2
 
+
+
+def _check_sheet(rule, rules, heads, sheet: str) -> int:
+    """Prints each configured column of one sheet (or CSV) with its effective setting; returns problems found."""
+    actual = next((k for k in heads if k.lower() == sheet.lower()), None)
+    if sheet and actual is None:
+        print("      sheet %s: NOT FOUND" % sheet)
+        return 1
+    header = {h.lower() for h in heads.get(actual if actual is not None else sheet, [])}
+    problems = 0
+    for c in rule.columns:
+        dom = rules.domains[c.domain]
+        found = c.name.lower() in header and (not c.entity_column or c.entity_column.lower() in header)
+        effective = dict(dom.params, **c.overrides)  # the column's own settings win over the domain/policy
+        setting = ", ".join("%s=%s" % (k, effective[k]) for k in ("mode", "method") if k in effective)
+        print("      %s%-28s -> %-16s %s%s" % ((sheet + ": ") if sheet else "", c.name, c.domain,
+                                           ("[%s] " % setting) if setting else "",
+                                           "" if found else "  <-- NOT FOUND"))
+        problems += 0 if found else 1
+    return problems
 
 def cmd_files_run(args):
     """De-identify CSV/Excel files into the output folder (originals are never modified)."""

@@ -16,7 +16,7 @@ from ..advisor import resolve_workers
 from ..audit import AuditTrail, new_run_id
 from ..config import Rules, Settings
 from ..database.connection import acquire_run_lock, server_info, with_retry
-from ..database.schema import SchemaCatalog, enabled_triggers, fk_status, index_disabled
+from ..database.schema import ColumnInfo, SchemaCatalog, enabled_triggers, fk_status, index_disabled
 from ..database.sql import hash_expr, qualified, quote_ident
 from ..masking import ALGORITHM_VERSION, BaseMasker, KeyRing, build_maskers, column_masker
 from .parallel import MaskingPool
@@ -26,10 +26,7 @@ from .validation import check_fits
 
 log = logging.getLogger("deid.engine")
 
-
 MAX_REPORTED_ERRORS = 10
-
-
 PARALLEL_MIN_ROWS = 100000
 
 
@@ -48,6 +45,26 @@ class ColumnStats:
     collisions: int = 0
     truncated: int = 0
     errors: List[str] = field(default_factory=list)
+
+    def add_error(self, message: str) -> None:
+        if len(self.errors) < MAX_REPORTED_ERRORS:
+            self.errors.append(message)
+
+
+def _truncate_limit(cp: ColumnPlan, masker: BaseMasker, targets: List[ColumnInfo]) -> int:
+    """Free text with on_overflow: truncate is cut to the narrowest target column; 0 = never cut."""
+    if cp.domain.type == "free_text" and masker.params.get("on_overflow") == "truncate":
+        return min([c.max_chars for c in targets if c.max_chars and c.max_chars > 0] or [0])
+    return 0
+
+
+def _fit(masked: Optional[str], targets: List[ColumnInfo], truncate_to: int,
+         st: ColumnStats) -> Tuple[Optional[str], Optional[str]]:
+    """(value, None) when the masked value fits every target column, else (value, error)."""
+    if truncate_to and masked is not None and len(masked) > truncate_to:
+        masked = masked[:truncate_to]
+        st.truncated += 1
+    return masked, next((e for e in (check_fits(c, masked) for c in targets) if e), None)
 
 
 class Engine:
@@ -129,31 +146,17 @@ class Engine:
         run_id = new_run_id()
         db_audit = bool(self.settings.audit.get("write_to_db", True)) and not dry_run
         if not dry_run:
-            # One masking run per database at a time (scheduled and manual runs alike).
-            self.lock_conn = self.factory.connect(autocommit=True)
-            if not acquire_run_lock(self.lock_conn, "pythondeid:%s" % info.get("database", "")):
-                raise RunLocked("Another masking run is in progress on database %s; try again when it has finished"
-                                % info.get("database"))
+            self._acquire_lock(info)
         if db_audit:
             self.audit_conn = self.factory.connect(autocommit=True)
         audit = AuditTrail(self.settings.audit, run_id, self.audit_conn if db_audit else None)
         audit.ensure_schema()
-        mode = "dry-run" if dry_run else "run"
         state: Dict[str, Any] = {"run_id": run_id, "fks_disabled": [], "indexes_disabled": []}
+        if resume_from:
+            state.update(self._resume_state(resume_from))
         self._state = state
 
-        if resume_from:
-            prev = AuditTrail.load_state(self.settings.audit["output_dir"], resume_from)
-            prev_summary = _load_summary(self.settings.audit["output_dir"], resume_from)
-            if prev_summary.get("rules_hash") != self.rules.content_hash:
-                raise PlanError("Rules changed since run %s; resume needs the identical rules file" % resume_from)
-            if prev_summary.get("key_fingerprint") != self.keyring.fingerprint():
-                raise PlanError("Secret key differs from run %s; resume needs the same DEID_SECRET_KEY" % resume_from)
-            state["fks_disabled"] = list(prev.get("fks_disabled", []))
-            state["indexes_disabled"] = list(prev.get("indexes_disabled", []))
-            state["resumed_from"] = resume_from
-
-        audit.start_run(mode, dict(
+        audit.start_run("dry-run" if dry_run else "run", dict(
             info, tool_version=__version__, rules_file=str(self.rules.source_path or ""),
             rules_hash=self.rules.content_hash, key_fingerprint=self.keyring.fingerprint(),
             profile=self.rules.profile, policy=dict(self.rules.policy),
@@ -168,54 +171,86 @@ class Engine:
         audit.save_state(state)
 
         self.work = self.factory.connect(autocommit=False)
-        completed = 0
-        total_rows = 0
-        failures: List[str] = []
+        completed, total_rows, failures = 0, 0, []
         try:
             if not dry_run:
                 self._disable_fks(plan, state, audit)
-            for tp in plan.tables:
-                prog = progress.get((tp.info.schema.lower(), tp.info.name.lower()), {})
-                if prog.get("status") == "COMPLETED":
-                    audit.event("INFO", "Skipped (completed in run %s)" % resume_from, tp.fqn)
-                    log.info("Skipping %s (already completed)", tp.fqn)
-                    completed += 1
-                    continue
-                try:
-                    total_rows += self._process_table(tp, run_id, dry_run, audit, prog)
-                    completed += 1
-                except Exception as exc:
-                    failures.append("%s: %s" % (tp.fqn, exc))
-                    log.error("Table %s failed: %s", tp.fqn, exc)
-                    audit.event("ERROR", str(exc), tp.fqn)
-                    if self.ex.get("stop_on_error", True):
-                        break
+            completed, total_rows, failures = self._process_tables(plan, run_id, dry_run, audit, progress,
+                                                                       resume_from)
         finally:
             if not dry_run:
-                if completed == len(plan.tables):
-                    failures.extend(self._enable_fks(state, audit))
-                elif state["fks_disabled"]:
-                    msg = ("Foreign keys left disabled because not all tables completed: %s. Fix the error and run "
-                           "'python main.py run --resume %s'." % (", ".join(f["name"] for f in state["fks_disabled"]), run_id))
-                    log.warning(msg)
-                    audit.event("WARN", msg)
-                audit.save_state(state)
+                failures.extend(self._finish_constraints(completed == len(plan.tables), state, audit, run_id))
             try:
                 self.work.rollback()
             except Exception as exc:
                 log.debug("Final rollback failed: %s", exc.__class__.__name__)
 
-        if dry_run:
-            status = "DRY_RUN_OK" if not failures else "DRY_RUN_ISSUES"
-        elif not failures:
-            status = "SUCCEEDED"
-        else:
-            # FAILED only when nothing was committed; otherwise the re-run guard must treat the data as touched.
-            status = "PARTIAL" if (completed or self._data_changed) else "FAILED"
-        message = "; ".join(failures)
-        audit.end_run(status, message, completed, total_rows)
+        status = self._final_status(dry_run, failures, completed)
+        audit.end_run(status, "; ".join(failures), completed, total_rows)
         return {"run_id": run_id, "status": status, "tables_completed": completed, "tables": len(plan.tables),
                 "rows_updated": total_rows, "failures": failures, "audit_dir": str(audit.dir)}
+
+    def _acquire_lock(self, info: Dict[str, Any]) -> None:
+        """One masking run per database at a time (scheduled and manual runs alike)."""
+        self.lock_conn = self.factory.connect(autocommit=True)
+        if not acquire_run_lock(self.lock_conn, "pythondeid:%s" % info.get("database", "")):
+            raise RunLocked("Another masking run is in progress on database %s; try again when it has finished"
+                            % info.get("database"))
+
+    def _resume_state(self, resume_from: str) -> Dict[str, Any]:
+        """Constraints left disabled by the run being resumed; refuses if the rules or key changed."""
+        out_dir = self.settings.audit["output_dir"]
+        prev = AuditTrail.load_state(out_dir, resume_from)
+        prev_summary = _load_summary(out_dir, resume_from)
+        if prev_summary.get("rules_hash") != self.rules.content_hash:
+            raise PlanError("Rules changed since run %s; resume needs the identical rules file" % resume_from)
+        if prev_summary.get("key_fingerprint") != self.keyring.fingerprint():
+            raise PlanError("Secret key differs from run %s; resume needs the same DEID_SECRET_KEY" % resume_from)
+        return {"fks_disabled": list(prev.get("fks_disabled", [])),
+                "indexes_disabled": list(prev.get("indexes_disabled", [])), "resumed_from": resume_from}
+
+    def _process_tables(self, plan: Plan, run_id: str, dry_run: bool, audit: AuditTrail,
+                        progress: Dict[Any, Dict[str, Any]], resume_from: Optional[str]) -> Tuple[int, int, List[str]]:
+        """Masks (or scans) each table in plan order; returns (tables completed, rows updated, failures)."""
+        completed, total_rows, failures = 0, 0, []
+        for tp in plan.tables:
+            prog = progress.get((tp.info.schema.lower(), tp.info.name.lower()), {})
+            if prog.get("status") == "COMPLETED":
+                audit.event("INFO", "Skipped (completed in run %s)" % resume_from, tp.fqn)
+                log.info("Skipping %s (already completed)", tp.fqn)
+                completed += 1
+                continue
+            try:
+                total_rows += self._process_table(tp, run_id, dry_run, audit, prog)
+                completed += 1
+            except Exception as exc:
+                failures.append("%s: %s" % (tp.fqn, exc))
+                log.error("Table %s failed: %s", tp.fqn, exc)
+                audit.event("ERROR", str(exc), tp.fqn)
+                if self.ex.get("stop_on_error", True):
+                    break
+        return completed, total_rows, failures
+
+    def _finish_constraints(self, all_done: bool, state: Dict[str, Any], audit: AuditTrail, run_id: str) -> List[str]:
+        """Re-enables FKs WITH CHECK once every table is done; otherwise leaves them for --resume."""
+        problems: List[str] = []
+        if all_done:
+            problems = self._enable_fks(state, audit)
+        elif state["fks_disabled"]:
+            msg = ("Foreign keys left disabled because not all tables completed: %s. Fix the error and run "
+                   "'python main.py run --resume %s'." % (", ".join(f["name"] for f in state["fks_disabled"]), run_id))
+            log.warning(msg)
+            audit.event("WARN", msg)
+        audit.save_state(state)
+        return problems
+
+    def _final_status(self, dry_run: bool, failures: List[str], completed: int) -> str:
+        if dry_run:
+            return "DRY_RUN_OK" if not failures else "DRY_RUN_ISSUES"
+        if not failures:
+            return "SUCCEEDED"
+        # FAILED only when nothing was committed; otherwise the re-run guard must treat the data as touched.
+        return "PARTIAL" if (completed or self._data_changed) else "FAILED"
 
     # ------------------------------------------------------------------ constraints
     def _disable_fks(self, plan: Plan, state: Dict[str, Any], audit: AuditTrail) -> None:
@@ -379,9 +414,7 @@ class Engine:
         check = bool(self.ex.get("collision_check", True) and masker.collision_check)
         seen = self._collisions.setdefault(cp.domain.name, {}) if check else None
         targets = [cp.info] + ([cp.output_info] if cp.output_info is not None else [])
-        truncate_to = 0  # free text may be cut to the narrowest target column (on_overflow: truncate)
-        if cp.domain.type == "free_text" and masker.params.get("on_overflow") == "truncate":
-            truncate_to = min([c.max_chars for c in targets if c.max_chars and c.max_chars > 0] or [0])
+        truncate_to = _truncate_limit(cp, masker, targets)
         rcur = self.read.cursor()
         rcur.execute(distinct_values_sql(tp, cp))
         batches = self._fetch_batches(rcur, int(self.ex.get("fetch_size", 20000)))
@@ -390,13 +423,9 @@ class Engine:
             for h, masked, err, digest in results:
                 st.distinct_before += 1
                 if err is None:
-                    if truncate_to and masked is not None and len(masked) > truncate_to:
-                        masked = masked[:truncate_to]
-                        st.truncated += 1
-                    err = next((e for e in (check_fits(c, masked) for c in targets) if e), None)
+                    masked, err = _fit(masked, targets, truncate_to, st)
                 if err:
-                    if len(st.errors) < MAX_REPORTED_ERRORS:
-                        st.errors.append(err)
+                    st.add_error(err)
                     continue
                 if seen is not None and masked is not None:
                     self._check_collision(cp, seen, masked, digest, st)
@@ -422,9 +451,8 @@ class Engine:
                 seen[masked] = digest
         elif prior != digest:
             st.collisions += 1
-            if len(st.errors) < MAX_REPORTED_ERRORS:
-                st.errors.append("collision: two different values mask to the same output in domain "
-                                 "'%s' (increase token_length)" % cp.domain.name)
+            st.add_error("collision: two different values mask to the same output in domain "
+                         "'%s' (increase token_length)" % cp.domain.name)
 
     def _map_insert_cursor(self):
         """Cursor for bulk inserts into #deid_map: fast_executemany with fixed parameter types (set once)."""
