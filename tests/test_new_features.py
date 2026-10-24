@@ -393,3 +393,21 @@ def test_fk_partner_inherits_column_method():
         {"table": "P", "columns": [{"name": "Name", "domain": "n", "method": "hash"}]},
         {"table": "C", "columns": [{"name": "PName", "domain": "n"}]}]})
     assert any("different per-column settings" in e for e in build_plan(cat, r2, {}, True, {}).errors)
+
+
+def test_plan_shows_the_method_each_column_uses():
+    from deid.config import parse_rules
+    from deid.database.schema import ColumnInfo, SchemaCatalog, TableInfo
+    from deid.engine import build_plan
+    cat = SchemaCatalog()
+    t = TableInfo("dbo", "T", primary_key=["Id"], unique_sets=[["Id"]])
+    t.columns = {"id": ColumnInfo("dbo", "T", "Id", "int", 4, 10, 0, False),
+                 "a": ColumnInfo("dbo", "T", "A", "varchar", 100, 0, 0, True),
+                 "b": ColumnInfo("dbo", "T", "B", "varchar", 100, 0, 0, True)}
+    cat.add_table(t)
+    r = parse_rules({"domains": {"n": {"type": "account_name"}}, "tables": [{"table": "T", "columns": [
+        {"name": "A", "domain": "n"}, {"name": "B", "domain": "n", "method": "redact"}]}]})
+    text = build_plan(cat, r, {}, True, {}).describe()
+    line_a = next(ln for ln in text.splitlines() if "- A " in ln)
+    line_b = next(ln for ln in text.splitlines() if "- B " in ln)
+    assert "method=realistic" in line_a and "method=redact (this column)" in line_b and "realistic" not in line_b

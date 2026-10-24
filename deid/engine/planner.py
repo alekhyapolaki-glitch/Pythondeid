@@ -91,11 +91,13 @@ class Plan:
                     extra.append("per-person shift by %s" % cp.entity_info.name)
                 if cp.output_info is not None:
                     extra.append("output_type %s" % cp.output_info.type_display())
+                effective = dict(cp.domain.params, **cp.overrides)  # what this column will actually use
                 for k in ("method", "mode"):
-                    if k in cp.domain.params:
-                        extra.append("%s=%s" % (k, cp.domain.params[k]))
-                if cp.overrides:
-                    extra.append(", ".join("%s=%s" % kv for kv in cp.overrides.items()))
+                    if k in effective:
+                        extra.append("%s=%s%s" % (k, effective[k], " (this column)" if k in cp.overrides else ""))
+                other = {k: v for k, v in cp.overrides.items() if k not in ("method", "mode")}
+                if other:
+                    extra.append(", ".join("%s=%s" % kv for kv in other.items()))
                 lines.append("      - %-30s %-16s -> domain '%s' (%s)%s" % (
                     cp.name, cp.info.type_display(), cp.domain.name, cp.domain.type,
                     ("  [%s]" % "; ".join(extra)) if extra else ""))

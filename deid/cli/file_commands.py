@@ -63,7 +63,8 @@ def cmd_files_validate(args):
             for c in rule.columns:
                 dom = rules.domains[c.domain]
                 found = c.name.lower() in header and (not c.entity_column or c.entity_column.lower() in header)
-                setting = ", ".join("%s=%s" % (k, dom.params[k]) for k in ("mode", "method") if k in dom.params)
+                effective = dict(dom.params, **c.overrides)  # the column's own settings win over the domain/policy
+                setting = ", ".join("%s=%s" % (k, effective[k]) for k in ("mode", "method") if k in effective)
                 print("      %s%-28s -> %-16s %s%s" % ((sheet + ": ") if sheet else "", c.name, c.domain,
                                                    ("[%s] " % setting) if setting else "",
                                                    "" if found else "  <-- NOT FOUND"))
